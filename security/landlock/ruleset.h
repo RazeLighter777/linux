@@ -40,6 +40,12 @@ struct landlock_layer {
 		 * down the file hierarchy.
 		 */
 		bool quiet:1;
+		/**
+		 * @no_inherit: When set, this layer's rule does not inherit
+		 * allowed accesses from parent objects within the same layer.
+		 * (currently only applies to filesystem objects)
+		 */
+		bool no_inherit:1;
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -56,6 +62,10 @@ struct collected_rule_flags {
 	 * @quiet_masks: Layers for which the quiet flag is effective.
 	 */
 	layer_mask_t quiet_masks;
+	/**
+	 * @no_inherit_masks: Layers for which the no_inherit flag is effective.
+	 */
+	layer_mask_t no_inherit_masks;
 };
 
 /**
