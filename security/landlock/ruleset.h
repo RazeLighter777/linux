@@ -46,6 +46,12 @@ struct landlock_layer {
 		 * (currently only applies to filesystem objects)
 		 */
 		bool no_inherit:1;
+		/**
+		 * @has_no_inherit_descendant: Marks that a descendant rule within
+		 * this layer carries the no-inherit flag and therefore seals
+		 * topology changes on the path.
+		 */
+		bool has_no_inherit_descendant:1;
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -66,6 +72,11 @@ struct collected_rule_flags {
 	 * @no_inherit_masks: Layers for which the no_inherit flag is effective.
 	 */
 	layer_mask_t no_inherit_masks;
+	/**
+	 * @no_inherit_desc_masks: Layers for which a descendant rule carries
+	 * the no_inherit flag.
+	 */
+	layer_mask_t no_inherit_desc_masks;
 };
 
 /**

@@ -257,6 +257,10 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 				return -EINVAL;
 			this->layers[0].access |= (*layers)[0].access;
 			this->layers[0].flags.quiet |= (*layers)[0].flags.quiet;
+			this->layers[0].flags.no_inherit |=
+				(*layers)[0].flags.no_inherit;
+			this->layers[0].flags.has_no_inherit_descendant |=
+				(*layers)[0].flags.has_no_inherit_descendant;
 			return 0;
 		}
 
@@ -316,6 +320,8 @@ int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 		.flags = {
 			.quiet = !!(flags & LANDLOCK_ADD_RULE_QUIET),
 			.no_inherit = !!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+			.has_no_inherit_descendant =
+				!!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
 		}
 	} };
 
@@ -671,6 +677,8 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 			rule_flags->quiet_masks |= layer_bit;
 		if (rule_flags && layer->flags.no_inherit)
 			rule_flags->no_inherit_masks |= layer_bit;
+		if (rule_flags && layer->flags.has_no_inherit_descendant)
+			rule_flags->no_inherit_desc_masks |= layer_bit;
 
 		/*
 		 * Records in @layer_masks which layer grants access to each requested

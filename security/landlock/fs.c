@@ -317,6 +317,21 @@ retry:
 	LANDLOCK_ACCESS_FS_IOCTL_DEV)
 /* clang-format on */
 
+static inline layer_mask_t landlock_layer_bit(
+	const struct landlock_layer *layer, u32 layer_index)
+{
+	u32 level = layer->level;
+
+	if (!level)
+		level = layer_index + 1;
+	return BIT_ULL(level - 1);
+}
+
+static void apply_cached_descendant_flags(struct landlock_ruleset *ruleset,
+				      struct dentry *dentry);
+static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
+				     const struct path *path);
+
 /*
  * @path: Should have been checked by get_path_from_fd().
  */
@@ -344,6 +359,11 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
 	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+	if (!err) {
+		apply_cached_descendant_flags(ruleset, path->dentry);
+		if (flags & LANDLOCK_ADD_RULE_NO_INHERIT)
+			mark_no_inherit_ancestors(ruleset, path);
+	}
 	mutex_unlock(&ruleset->lock);
 	/*
 	 * No need to check for an error because landlock_insert_rule()
@@ -380,6 +400,113 @@ find_rule(const struct landlock_ruleset *const domain,
 	rule = landlock_find_rule(domain, id);
 	rcu_read_unlock();
 	return rule;
+}
+
+static void apply_cached_descendant_flags(struct landlock_ruleset *ruleset,
+				      struct dentry *dentry)
+{
+	struct inode *inode;
+	struct landlock_inode_security *inode_sec;
+	layer_mask_t descendant_layers;
+	const struct landlock_rule *rule;
+	struct landlock_rule *mutable_rule;
+	u32 layer_index;
+
+	if (!ruleset || !dentry || d_is_negative(dentry))
+		return;
+
+	inode = d_backing_inode(dentry);
+	inode_sec = landlock_inode(inode);
+	descendant_layers = inode_sec->no_inherit_desc_layers;
+	if (!descendant_layers)
+		return;
+
+	rule = find_rule(ruleset, dentry);
+	if (!rule)
+		return;
+
+	mutable_rule = (struct landlock_rule *)rule;
+	for (layer_index = 0; layer_index < mutable_rule->num_layers; layer_index++) {
+		struct landlock_layer *layer =
+			&mutable_rule->layers[layer_index];
+		layer_mask_t layer_bit = landlock_layer_bit(layer, layer_index);
+
+		if (descendant_layers & layer_bit)
+			layer->flags.has_no_inherit_descendant = true;
+	}
+}
+
+static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
+				     const struct path *path)
+{
+	const struct landlock_rule *desc_rule;
+	layer_mask_t descendant_layers = 0;
+	struct dentry *cursor;
+	u32 layer_index;
+
+	if (!ruleset || !path || !path->dentry)
+		return;
+
+	desc_rule = find_rule(ruleset, path->dentry);
+	if (!desc_rule)
+		return;
+
+	for (layer_index = 0; layer_index < desc_rule->num_layers; layer_index++) {
+		const struct landlock_layer *layer =
+			&desc_rule->layers[layer_index];
+
+		if (layer->flags.no_inherit ||
+		    layer->flags.has_no_inherit_descendant)
+			descendant_layers |=
+				landlock_layer_bit(layer, layer_index);
+	}
+
+	if (!descendant_layers)
+		return;
+
+	cursor = dget(path->dentry);
+	while (cursor) {
+		struct dentry *parent;
+
+		if (IS_ROOT(cursor)) {
+			dput(cursor);
+			break;
+		}
+
+		parent = dget_parent(cursor);
+		dput(cursor);
+		if (!parent)
+			break;
+
+		if (!d_is_negative(parent)) {
+			struct inode *parent_inode = d_backing_inode(parent);
+			struct landlock_inode_security *parent_sec =
+				landlock_inode(parent_inode);
+			const struct landlock_rule *rule;
+
+			parent_sec->no_inherit_desc_layers |= descendant_layers;
+
+			rule = find_rule(ruleset, parent);
+			if (rule) {
+				struct landlock_rule *mutable_rule =
+					(struct landlock_rule *)rule;
+
+				for (layer_index = 0;
+				     layer_index < mutable_rule->num_layers;
+				     layer_index++) {
+					struct landlock_layer *layer =
+						&mutable_rule->layers[layer_index];
+					layer_mask_t layer_bit =
+						landlock_layer_bit(layer, layer_index);
+
+					if (descendant_layers & layer_bit)
+						layer->flags.has_no_inherit_descendant = true;
+				}
+			}
+		}
+
+		cursor = parent;
+	}
 }
 
 /*
@@ -1233,6 +1360,65 @@ cancel_walk:
 	return ret;
 }
 
+static layer_mask_t collect_no_inherit_layers(
+	const struct landlock_ruleset *domain, struct dentry *dentry)
+{
+	const struct landlock_rule *rule;
+	struct inode *inode;
+	layer_mask_t layers = 0;
+	u32 layer_index;
+
+	if (!domain || !dentry || d_is_negative(dentry))
+		return 0;
+
+	inode = d_backing_inode(dentry);
+	layers |= landlock_inode(inode)->no_inherit_desc_layers;
+
+	rule = find_rule(domain, dentry);
+	if (!rule)
+		return layers;
+
+	for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
+		const struct landlock_layer *layer = &rule->layers[layer_index];
+		layer_mask_t layer_bit = landlock_layer_bit(layer, layer_index);
+
+		if (layer->flags.no_inherit ||
+		    layer->flags.has_no_inherit_descendant)
+			layers |= layer_bit;
+	}
+
+	return layers;
+}
+
+static int deny_no_inherit_topology_change(
+	const struct landlock_cred_security *subject,
+	struct dentry *dentry)
+{
+	layer_mask_t sealed_layers;
+	unsigned long layer_index;
+
+	if (!subject || !dentry || d_is_negative(dentry))
+		return 0;
+	if (!d_is_dir(dentry))
+		return 0;
+
+	sealed_layers = collect_no_inherit_layers(subject->domain, dentry);
+	if (!sealed_layers)
+		return 0;
+
+	layer_index = __ffs((unsigned long)sealed_layers);
+	landlock_log_denial(subject, &(struct landlock_request) {
+		.type = LANDLOCK_REQUEST_FS_CHANGE_TOPOLOGY,
+		.audit = {
+			.type = LSM_AUDIT_DATA_DENTRY,
+			.u.dentry = dentry,
+		},
+		.layer_plus_one = layer_index + 1,
+	}, no_rule_flags);
+
+	return -EACCES;
+}
+
 /**
  * current_check_refer_path - Check if a rename or link action is allowed
  *
@@ -1319,6 +1505,16 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 	access_request_parent2 =
 		get_mode_access(d_backing_inode(old_dentry)->i_mode);
 	if (removable) {
+		int err;
+
+		err = deny_no_inherit_topology_change(subject, old_dentry);
+		if (err)
+			return err;
+		if (exchange) {
+			err = deny_no_inherit_topology_change(subject, new_dentry);
+			if (err)
+				return err;
+		}
 		access_request_parent1 |= maybe_remove(old_dentry);
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
