@@ -72,7 +72,7 @@ struct landlock_object {
 		 * @underops: Enables landlock_put_object() to release the
 		 * underlying object (e.g. inode).
 		 */
-		const struct landlock_object_underops *underops;
+		 const struct landlock_object_underops *underops;
 	};
 };
 

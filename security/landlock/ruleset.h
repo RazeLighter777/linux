@@ -15,6 +15,7 @@
 #include <linux/rbtree.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include "access.h"
 #include "limits.h"
@@ -157,25 +158,8 @@ struct landlock_rule {
 	struct landlock_layer layers[] __counted_by(num_layers);
 };
 
-/**
- * struct landlock_no_inherit_desc_node - Tracks no-inherit descendant layers per object
- *
- * This structure is used within a domain's rb_tree to track which layers
- * have no-inherit descendants for each inode object.
- */
-struct landlock_no_inherit_desc_node {
-	/**
-	 * @node: Node in the ruleset's no_inherit_desc red-black tree.
-	 */
-	struct rb_node node;
-	/**
-	 * @object: Landlock object (typically inode) this tracking applies to.
-	 */
+struct landlock_no_inherit_desc {
 	struct landlock_object *object;
-	/**
-	 * @desc_layers: Bitmask of layers that have no-inherit descendants
-	 * for this object.
-	 */
 	layer_mask_t desc_layers;
 };
 
@@ -203,14 +187,6 @@ struct landlock_ruleset {
 	 */
 	struct rb_root root_net_port;
 #endif /* IS_ENABLED(CONFIG_INET) */
-
-	/**
-	 * @root_no_inherit_desc: Root of a red-black tree tracking which layers
-	 * have no-inherit descendants for each inode object. Keys are landlock_object
-	 * pointers, values are layer_mask_t bitmasks. This is domain-specific tracking
-	 * needed for the no-inherit topology protection feature.
-	 */
-	struct rb_root root_no_inherit_desc;
 
 	/**
 	 * @hierarchy: Enables hierarchy identification even when a parent
@@ -241,6 +217,8 @@ struct landlock_ruleset {
 			 * @num_rules: Number of non-overlapping (i.e. not for
 			 * the same object) rules in this ruleset.
 			 */
+
+	struct xarray no_inherit_desc;
 			u32 num_rules;
 			/**
 			 * @num_layers: Number of layers that are used in this
@@ -395,5 +373,13 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 			  const access_mask_t access_request,
 			  layer_mask_t (*const layer_masks)[],
 			  const enum landlock_key_type key_type);
+
+layer_mask_t landlock_get_no_inherit_desc_layers(
+	const struct landlock_ruleset *ruleset,
+	struct landlock_object *object);
+
+void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
+	struct landlock_object *object,
+	layer_mask_t layers);
 
 #endif /* _SECURITY_LANDLOCK_RULESET_H */

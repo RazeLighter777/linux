@@ -47,9 +47,8 @@ static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 	new_ruleset->root_net_port = RB_ROOT;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
-	new_ruleset->root_no_inherit_desc = RB_ROOT;
-
 	new_ruleset->num_layers = num_layers;
+	xa_init(&new_ruleset->no_inherit_desc);
 	/*
 	 * hierarchy = NULL
 	 * num_rules = 0
@@ -107,6 +106,62 @@ static bool is_object_pointer(const enum landlock_key_type key_type)
 	default:
 		WARN_ON_ONCE(1);
 		return false;
+	}
+}
+
+layer_mask_t landlock_get_no_inherit_desc_layers(
+	const struct landlock_ruleset *ruleset,
+	struct landlock_object *object)
+{
+	struct landlock_no_inherit_desc *desc;
+
+	if (!ruleset || !object)
+		return 0;
+
+	desc = xa_load((struct xarray *)&ruleset->no_inherit_desc,
+		       (unsigned long)object);
+	if (!desc)
+		return 0;
+
+	return desc->desc_layers;
+}
+
+void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
+	struct landlock_object *object,
+	layer_mask_t layers)
+{
+	struct landlock_no_inherit_desc *desc;
+	int err;
+
+	if (!ruleset || !object || !layers)
+		return;
+
+	desc = xa_load(&ruleset->no_inherit_desc, (unsigned long)object);
+	if (desc) {
+		desc->desc_layers |= layers;
+		return;
+	}
+
+	desc = kzalloc(sizeof(*desc), GFP_KERNEL_ACCOUNT);
+	if (!desc)
+		return;
+
+	desc->object = object;
+	desc->desc_layers = layers;
+	landlock_get_object(object);
+	err = xa_insert(&ruleset->no_inherit_desc, (unsigned long)object, desc,
+			 GFP_KERNEL_ACCOUNT);
+	if (err) {
+		struct landlock_no_inherit_desc *existing;
+
+		if (err == -EBUSY) {
+			existing = xa_load(&ruleset->no_inherit_desc,
+					 (unsigned long)object);
+			if (existing)
+				existing->desc_layers |= layers;
+		}
+		landlock_put_object(object);
+		kfree(desc);
 	}
 }
 
@@ -374,59 +429,6 @@ static int merge_tree(struct landlock_ruleset *const dst,
 	return err;
 }
 
-static int merge_no_inherit_desc_tree(struct landlock_ruleset *const dst,
-				      struct landlock_ruleset *const src)
-{
-	struct landlock_no_inherit_desc_node *desc_node, *next_node;
-
-	might_sleep();
-	lockdep_assert_held(&dst->lock);
-	lockdep_assert_held(&src->lock);
-
-	/* Merges the @src no_inherit_desc tree into @dst. */
-	rbtree_postorder_for_each_entry_safe(desc_node, next_node,
-					     &src->root_no_inherit_desc, node) {
-		struct rb_node **new_rb = &dst->root_no_inherit_desc.rb_node;
-		struct rb_node *parent_rb = NULL;
-		struct landlock_no_inherit_desc_node *dst_node;
-		bool found = false;
-
-		/* Search for existing node in dst tree */
-		while (*new_rb) {
-			dst_node = rb_entry(*new_rb, struct landlock_no_inherit_desc_node, node);
-			parent_rb = *new_rb;
-
-			if (desc_node->object < dst_node->object) {
-				new_rb = &((*new_rb)->rb_left);
-			} else if (desc_node->object > dst_node->object) {
-				new_rb = &((*new_rb)->rb_right);
-			} else {
-				/* Object already exists, merge the layers */
-				dst_node->desc_layers |= desc_node->desc_layers;
-				found = true;
-				break;
-			}
-		}
-
-		if (!found) {
-			/* Create new node in dst tree */
-			struct landlock_no_inherit_desc_node *new_node;
-
-			new_node = kzalloc(sizeof(*new_node), GFP_KERNEL_ACCOUNT);
-			if (!new_node)
-				return -ENOMEM;
-
-			new_node->object = desc_node->object;
-			new_node->desc_layers = desc_node->desc_layers;
-			landlock_get_object(new_node->object);
-
-			rb_link_node(&new_node->node, parent_rb, new_rb);
-			rb_insert_color(&new_node->node, &dst->root_no_inherit_desc);
-		}
-	}
-	return 0;
-}
-
 static int merge_ruleset(struct landlock_ruleset *const dst,
 			 struct landlock_ruleset *const src)
 {
@@ -464,10 +466,14 @@ static int merge_ruleset(struct landlock_ruleset *const dst,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
-	/* Merges the @src no_inherit_desc tree. */
-	err = merge_no_inherit_desc_tree(dst, src);
-	if (err)
-		goto out_unlock;
+	{
+		unsigned long index;
+		struct landlock_no_inherit_desc *desc;
+
+		xa_for_each(&src->no_inherit_desc, index, desc)
+			landlock_set_no_inherit_desc_layers(dst, desc->object,
+						       desc->desc_layers);
+	}
 
 out_unlock:
 	mutex_unlock(&src->lock);
@@ -507,60 +513,6 @@ static int inherit_tree(struct landlock_ruleset *const parent,
 	return err;
 }
 
-static int inherit_no_inherit_desc_tree(struct landlock_ruleset *const parent,
-					struct landlock_ruleset *const child)
-{
-	struct landlock_no_inherit_desc_node *desc_node, *next_node;
-
-	might_sleep();
-	lockdep_assert_held(&parent->lock);
-	lockdep_assert_held(&child->lock);
-
-	/* Copies the @parent no_inherit_desc tree. */
-	rbtree_postorder_for_each_entry_safe(desc_node, next_node,
-					     &parent->root_no_inherit_desc, node) {
-		struct landlock_no_inherit_desc_node *new_node;
-
-		new_node = kzalloc(sizeof(*new_node), GFP_KERNEL_ACCOUNT);
-		if (!new_node)
-			return -ENOMEM;
-
-		new_node->object = desc_node->object;
-		new_node->desc_layers = desc_node->desc_layers;
-		landlock_get_object(new_node->object);
-
-		/* Insert into child's tree */
-		{
-			struct rb_node **new_rb = &child->root_no_inherit_desc.rb_node;
-			struct rb_node *parent_rb = NULL;
-
-			while (*new_rb) {
-				struct landlock_no_inherit_desc_node *this =
-					rb_entry(*new_rb, struct landlock_no_inherit_desc_node, node);
-				parent_rb = *new_rb;
-
-				if (new_node->object < this->object)
-					new_rb = &((*new_rb)->rb_left);
-				else if (new_node->object > this->object)
-					new_rb = &((*new_rb)->rb_right);
-				else {
-					/* Should not happen, but handle gracefully */
-					this->desc_layers |= new_node->desc_layers;
-					landlock_put_object(new_node->object);
-					kfree(new_node);
-					goto next_node;
-				}
-			}
-
-			rb_link_node(&new_node->node, parent_rb, new_rb);
-			rb_insert_color(&new_node->node, &child->root_no_inherit_desc);
-		}
-next_node:
-		;
-	}
-	return 0;
-}
-
 static int inherit_ruleset(struct landlock_ruleset *const parent,
 			   struct landlock_ruleset *const child)
 {
@@ -586,10 +538,14 @@ static int inherit_ruleset(struct landlock_ruleset *const parent,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
-	/* Copies the @parent no_inherit_desc tree. */
-	err = inherit_no_inherit_desc_tree(parent, child);
-	if (err)
-		goto out_unlock;
+	{
+		unsigned long index;
+		struct landlock_no_inherit_desc *desc;
+
+		xa_for_each(&parent->no_inherit_desc, index, desc)
+			landlock_set_no_inherit_desc_layers(child, desc->object,
+						       desc->desc_layers);
+	}
 
 	if (WARN_ON_ONCE(child->num_layers <= parent->num_layers)) {
 		err = -EINVAL;
@@ -615,7 +571,8 @@ out_unlock:
 static void free_ruleset(struct landlock_ruleset *const ruleset)
 {
 	struct landlock_rule *freeme, *next;
-	struct landlock_no_inherit_desc_node *desc_node, *desc_next;
+	struct landlock_no_inherit_desc *desc;
+	unsigned long index;
 
 	might_sleep();
 	rbtree_postorder_for_each_entry_safe(freeme, next, &ruleset->root_inode,
@@ -628,12 +585,11 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 		free_rule(freeme, LANDLOCK_KEY_NET_PORT);
 #endif /* IS_ENABLED(CONFIG_INET) */
 
-	/* Free no_inherit_desc tree */
-	rbtree_postorder_for_each_entry_safe(desc_node, desc_next,
-					     &ruleset->root_no_inherit_desc, node) {
-		landlock_put_object(desc_node->object);
-		kfree(desc_node);
+	xa_for_each(&ruleset->no_inherit_desc, index, desc) {
+		landlock_put_object(desc->object);
+		kfree(desc);
 	}
+	xa_destroy(&ruleset->no_inherit_desc);
 
 	landlock_put_hierarchy(ruleset->hierarchy);
 	kfree(ruleset);
