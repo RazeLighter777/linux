@@ -38,13 +38,6 @@ struct landlock_inode_security {
 	 * performed by get_inode_object().
 	 */
 	struct landlock_object __rcu *object;
-	/**
-	 * @no_inherit_desc_layers: Tracks layers for which a descendant rule
-	 * carries %LANDLOCK_ADD_RULE_NO_INHERIT.  This provides a cache so
-	 * future parent rule insertions can immediately inherit the
-	 * has_no_inherit_descendant flag without walking the filesystem tree.
-	 */
-	layer_mask_t no_inherit_desc_layers;
 };
 
 /**

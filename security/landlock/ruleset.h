@@ -158,6 +158,28 @@ struct landlock_rule {
 };
 
 /**
+ * struct landlock_no_inherit_desc_node - Tracks no-inherit descendant layers per object
+ *
+ * This structure is used within a domain's rb_tree to track which layers
+ * have no-inherit descendants for each inode object.
+ */
+struct landlock_no_inherit_desc_node {
+	/**
+	 * @node: Node in the ruleset's no_inherit_desc red-black tree.
+	 */
+	struct rb_node node;
+	/**
+	 * @object: Landlock object (typically inode) this tracking applies to.
+	 */
+	struct landlock_object *object;
+	/**
+	 * @desc_layers: Bitmask of layers that have no-inherit descendants
+	 * for this object.
+	 */
+	layer_mask_t desc_layers;
+};
+
+/**
  * struct landlock_ruleset - Landlock ruleset
  *
  * This data structure must contain unique entries, be updatable, and quick to
@@ -181,6 +203,14 @@ struct landlock_ruleset {
 	 */
 	struct rb_root root_net_port;
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+	/**
+	 * @root_no_inherit_desc: Root of a red-black tree tracking which layers
+	 * have no-inherit descendants for each inode object. Keys are landlock_object
+	 * pointers, values are layer_mask_t bitmasks. This is domain-specific tracking
+	 * needed for the no-inherit topology protection feature.
+	 */
+	struct rb_root root_no_inherit_desc;
 
 	/**
 	 * @hierarchy: Enables hierarchy identification even when a parent
