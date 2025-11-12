@@ -113,17 +113,15 @@ layer_mask_t landlock_get_no_inherit_desc_layers(
 	const struct landlock_ruleset *ruleset,
 	struct landlock_object *object)
 {
-	struct landlock_no_inherit_desc *desc;
-
 	if (!ruleset || !object)
 		return 0;
 
-	desc = xa_load((struct xarray *)&ruleset->no_inherit_desc,
-		       (unsigned long)object);
-	if (!desc)
-		return 0;
-
-	return desc->desc_layers;
+	/*
+	 * Use the cached value from the object to avoid xarray lookup on the
+	 * hot path. The cache is the union of desc_layers from all rulesets
+	 * and is updated by landlock_set_no_inherit_desc_layers().
+	 */
+	return object->no_inherit_desc_layers;
 }
 
 void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
@@ -135,6 +133,15 @@ void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
 
 	if (!ruleset || !object || !layers)
 		return;
+
+	/*
+	 * Update the cache in the object. This cache is the union of all
+	 * desc_layers across all rulesets for this object, so we OR in the
+	 * new layers. The cache is protected by object->lock.
+	 */
+	spin_lock(&object->lock);
+	object->no_inherit_desc_layers |= layers;
+	spin_unlock(&object->lock);
 
 	desc = xa_load(&ruleset->no_inherit_desc, (unsigned long)object);
 	if (desc) {
