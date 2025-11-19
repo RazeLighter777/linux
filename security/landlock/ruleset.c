@@ -109,21 +109,6 @@ static bool is_object_pointer(const enum landlock_key_type key_type)
 	}
 }
 
-layer_mask_t landlock_get_no_inherit_desc_layers(
-	const struct landlock_ruleset *ruleset,
-	struct landlock_object *object)
-{
-	if (!ruleset || !object)
-		return 0;
-
-	/*
-	 * Use the cached value from the object to avoid xarray lookup on the
-	 * hot path. The cache is the union of desc_layers from all rulesets
-	 * and is updated by landlock_set_no_inherit_desc_layers().
-	 */
-	return object->no_inherit_desc_layers;
-}
-
 void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
 	struct landlock_object *object,
 	layer_mask_t layers)

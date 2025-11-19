@@ -349,7 +349,7 @@ static layer_mask_t get_no_inherit_desc_layers_for_dentry(
 	rcu_read_lock();
 	object = rcu_dereference(landlock_inode(d_backing_inode(dentry))->object);
 	if (object)
-		layers |= landlock_get_no_inherit_desc_layers(ruleset, object);
+		layers |= object->no_inherit_desc_layers;
 	rcu_read_unlock();
 
 	rule = find_rule(ruleset, dentry);
