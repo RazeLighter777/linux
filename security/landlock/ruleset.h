@@ -217,8 +217,12 @@ struct landlock_ruleset {
 			 * @num_rules: Number of non-overlapping (i.e. not for
 			 * the same object) rules in this ruleset.
 			 */
-
-	struct xarray no_inherit_desc;
+			/**
+			 * @no_inherit_desc: XArray containing objects
+			 * with no_inherit descendants in this ruleset.
+			 * This is used to quickly merge no_inherit flags,
+			 */
+			struct xarray no_inherit_desc;
 			u32 num_rules;
 			/**
 			 * @num_layers: Number of layers that are used in this
@@ -374,9 +378,7 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 			  layer_mask_t (*const layer_masks)[],
 			  const enum landlock_key_type key_type);
 
-layer_mask_t landlock_get_no_inherit_desc_layers(
-	const struct landlock_ruleset *ruleset,
-	struct landlock_object *object);
+
 
 void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
 	struct landlock_object *object,
