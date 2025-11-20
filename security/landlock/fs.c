@@ -436,9 +436,8 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 	};
 
 	/* Files only get access rights that make sense. */
-	if (!d_is_dir(path->dentry) &&
-	    (access_rights | ACCESS_FILE) != ACCESS_FILE)
-		return -EINVAL;
+	if (!d_is_dir(path->dentry))
+		access_rights &= ACCESS_FILE;
 	if (WARN_ON_ONCE(ruleset->num_layers != 1))
 		return -EINVAL;
 
@@ -1472,10 +1471,44 @@ cancel_walk:
 static layer_mask_t collect_no_inherit_layers(
 	const struct landlock_ruleset *domain, struct dentry *dentry)
 {
-	if (!domain || !dentry || d_is_negative(dentry))
+	struct dentry *cursor;
+	layer_mask_t layers = 0;
+	layer_mask_t active_layers = 0;
+
+	if (!domain || !dentry)
 		return 0;
 
-	return get_no_inherit_desc_layers_for_dentry(domain, dentry);
+	cursor = dget(dentry);
+	if (!cursor)
+		return 0;
+
+	active_layers = get_no_inherit_desc_layers_for_dentry(domain, cursor);
+	layers |= active_layers;
+
+	while (true) {
+		struct dentry *parent;
+
+		if (!active_layers || IS_ROOT(cursor) || d_is_negative(cursor))
+			break;
+
+		parent = dget_parent(cursor);
+		dput(cursor);
+		if (!parent)
+			return layers;
+		cursor = parent;
+
+		if (d_is_negative(cursor)) {
+			active_layers = 0;
+			break;
+		}
+
+		active_layers &= get_no_inherit_desc_layers_for_dentry(domain,
+			cursor);
+		layers |= active_layers;
+	}
+
+	dput(cursor);
+	return layers;
 }
 
 static int deny_no_inherit_topology_change(
@@ -1486,8 +1519,6 @@ static int deny_no_inherit_topology_change(
 	unsigned long layer_index;
 
 	if (!subject || !dentry || d_is_negative(dentry))
-		return 0;
-	if (!d_is_dir(dentry))
 		return 0;
 
 	sealed_layers = collect_no_inherit_layers(subject->domain, dentry);
@@ -1995,6 +2026,14 @@ static int hook_path_symlink(const struct path *const dir,
 static int hook_path_unlink(const struct path *const dir,
 			    struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_FILE);
 }
 
