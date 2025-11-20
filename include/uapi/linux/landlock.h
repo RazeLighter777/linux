@@ -127,10 +127,24 @@ struct landlock_ruleset_attr {
  *     allowed_access in the passed in rule_attr.  When this flag is
  *     present, the caller is also allowed to pass in an empty
  *     allowed_access.
+ * %LANDLOCK_ADD_RULE_NO_INHERIT
+ *     When this flag is set while adding a rule to a ruleset, the rule
+ *     will not inherit allowed accesses from rules on parent objects
+ *     within the same layer. (currently only applies to filesystem objects)
+ *     By default, Landlock rules added to a ruleset inherit allowed accesses
+ *     from parent objects, meaning that if a parent directory has been granted
+ *     certain access rights, those rights will also apply to its child objects.
+ *     This flag prevents such inheritance for the specific rule being added.
+ *     This flag also prevents refer and removal operations in the direct parent
+ *     hierarchy of the object covered by this rule, unless those operations are
+ *     explicitly allowed by other rules in the same layer.
+ *     Finally, this flag also blocks the inheritance of flags from parent layers,
+ *     such as the quiet flag, to the object covered by this rule.
  */
 
 /* clang-format off */
 #define LANDLOCK_ADD_RULE_QUIET			(1U << 0)
+#define LANDLOCK_ADD_RULE_NO_INHERIT		(1U << 1)
 /* clang-format on */
 
 /**
