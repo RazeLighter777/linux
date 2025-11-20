@@ -13,6 +13,8 @@
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 
+#include "access.h"
+
 struct landlock_object;
 
 /**

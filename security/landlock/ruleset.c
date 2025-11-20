@@ -48,6 +48,7 @@ static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	new_ruleset->num_layers = num_layers;
+	xa_init(&new_ruleset->no_inherit_desc);
 	/*
 	 * hierarchy = NULL
 	 * num_rules = 0
@@ -105,6 +106,45 @@ static bool is_object_pointer(const enum landlock_key_type key_type)
 	default:
 		WARN_ON_ONCE(1);
 		return false;
+	}
+}
+
+void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
+	struct landlock_object *object,
+	layer_mask_t layers)
+{
+	struct landlock_no_inherit_desc *desc;
+	int err;
+
+	if (!ruleset || !object || !layers)
+		return;
+
+	desc = xa_load(&ruleset->no_inherit_desc, (unsigned long)object);
+	if (desc) {
+		desc->desc_layers |= layers;
+		return;
+	}
+
+	desc = kzalloc(sizeof(*desc), GFP_KERNEL_ACCOUNT);
+	if (!desc)
+		return;
+
+	desc->object = object;
+	desc->desc_layers = layers;
+	landlock_get_object(object);
+	err = xa_insert(&ruleset->no_inherit_desc, (unsigned long)object, desc,
+			 GFP_KERNEL_ACCOUNT);
+	if (err) {
+		struct landlock_no_inherit_desc *existing;
+
+		if (err == -EBUSY) {
+			existing = xa_load(&ruleset->no_inherit_desc,
+					 (unsigned long)object);
+			if (existing)
+				existing->desc_layers |= layers;
+		}
+		landlock_put_object(object);
+		kfree(desc);
 	}
 }
 
@@ -257,6 +297,10 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 				return -EINVAL;
 			this->layers[0].access |= (*layers)[0].access;
 			this->layers[0].flags.quiet |= (*layers)[0].flags.quiet;
+			this->layers[0].flags.no_inherit |=
+				(*layers)[0].flags.no_inherit;
+			this->layers[0].flags.has_no_inherit_descendant |=
+				(*layers)[0].flags.has_no_inherit_descendant;
 			return 0;
 		}
 
@@ -315,7 +359,10 @@ int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 		.level = 0,
 		.flags = {
 			.quiet = !!(flags & LANDLOCK_ADD_RULE_QUIET),
-		},
+			.no_inherit = !!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+			.has_no_inherit_descendant =
+				!!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+		}
 	} };
 
 	build_check_layer();
@@ -402,6 +449,15 @@ static int merge_ruleset(struct landlock_ruleset *const dst,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+	{
+		unsigned long index;
+		struct landlock_no_inherit_desc *desc;
+
+		xa_for_each(&src->no_inherit_desc, index, desc)
+			landlock_set_no_inherit_desc_layers(dst, desc->object,
+						       desc->desc_layers);
+	}
+
 out_unlock:
 	mutex_unlock(&src->lock);
 	mutex_unlock(&dst->lock);
@@ -465,6 +521,15 @@ static int inherit_ruleset(struct landlock_ruleset *const parent,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+	{
+		unsigned long index;
+		struct landlock_no_inherit_desc *desc;
+
+		xa_for_each(&parent->no_inherit_desc, index, desc)
+			landlock_set_no_inherit_desc_layers(child, desc->object,
+						       desc->desc_layers);
+	}
+
 	if (WARN_ON_ONCE(child->num_layers <= parent->num_layers)) {
 		err = -EINVAL;
 		goto out_unlock;
@@ -489,6 +554,8 @@ out_unlock:
 static void free_ruleset(struct landlock_ruleset *const ruleset)
 {
 	struct landlock_rule *freeme, *next;
+	struct landlock_no_inherit_desc *desc;
+	unsigned long index;
 
 	might_sleep();
 	rbtree_postorder_for_each_entry_safe(freeme, next, &ruleset->root_inode,
@@ -500,6 +567,12 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 					     &ruleset->root_net_port, node)
 		free_rule(freeme, LANDLOCK_KEY_NET_PORT);
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+	xa_for_each(&ruleset->no_inherit_desc, index, desc) {
+		landlock_put_object(desc->object);
+		kfree(desc);
+	}
+	xa_destroy(&ruleset->no_inherit_desc);
 
 	landlock_put_hierarchy(ruleset->hierarchy);
 	kfree(ruleset);
@@ -660,9 +733,18 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 		unsigned long access_bit;
 		bool is_empty;
 
+		/* Skip layers that already have no inherit flags. */
+		if (rule_flags &&
+		    (rule_flags->no_inherit_masks & layer_bit))
+			continue;
+
 		/* Collect rule flags for each layer. */
 		if (rule_flags && layer->flags.quiet)
 			rule_flags->quiet_masks |= layer_bit;
+		if (rule_flags && layer->flags.no_inherit)
+			rule_flags->no_inherit_masks |= layer_bit;
+		if (rule_flags && layer->flags.has_no_inherit_descendant)
+			rule_flags->no_inherit_desc_masks |= layer_bit;
 
 		/*
 		 * Records in @layer_masks which layer grants access to each requested

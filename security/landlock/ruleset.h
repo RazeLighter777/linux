@@ -15,6 +15,7 @@
 #include <linux/rbtree.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include "access.h"
 #include "limits.h"
@@ -40,6 +41,18 @@ struct landlock_layer {
 		 * down the file hierarchy.
 		 */
 		bool quiet:1;
+		/**
+		 * @no_inherit: When set, this layer's rule does not inherit
+		 * allowed accesses from parent objects within the same layer.
+		 * (currently only applies to filesystem objects)
+		 */
+		bool no_inherit:1;
+		/**
+		 * @has_no_inherit_descendant: Marks that a descendant rule within
+		 * this layer carries the no-inherit flag and therefore seals
+		 * topology changes on the path.
+		 */
+		bool has_no_inherit_descendant:1;
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -56,6 +69,15 @@ struct collected_rule_flags {
 	 * @quiet_masks: Layers for which the quiet flag is effective.
 	 */
 	layer_mask_t quiet_masks;
+	/**
+	 * @no_inherit_masks: Layers for which the no_inherit flag is effective.
+	 */
+	layer_mask_t no_inherit_masks;
+	/**
+	 * @no_inherit_desc_masks: Layers for which a descendant rule carries
+	 * the no_inherit flag.
+	 */
+	layer_mask_t no_inherit_desc_masks;
 };
 
 /**
@@ -136,6 +158,11 @@ struct landlock_rule {
 	struct landlock_layer layers[] __counted_by(num_layers);
 };
 
+struct landlock_no_inherit_desc {
+	struct landlock_object *object;
+	layer_mask_t desc_layers;
+};
+
 /**
  * struct landlock_ruleset - Landlock ruleset
  *
@@ -190,6 +217,12 @@ struct landlock_ruleset {
 			 * @num_rules: Number of non-overlapping (i.e. not for
 			 * the same object) rules in this ruleset.
 			 */
+			/**
+			 * @no_inherit_desc: XArray containing objects
+			 * with no_inherit descendants in this ruleset.
+			 * This is used to quickly merge no_inherit flags,
+			 */
+			struct xarray no_inherit_desc;
 			u32 num_rules;
 			/**
 			 * @num_layers: Number of layers that are used in this
@@ -344,5 +377,11 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 			  const access_mask_t access_request,
 			  layer_mask_t (*const layer_masks)[],
 			  const enum landlock_key_type key_type);
+
+
+
+void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
+	struct landlock_object *object,
+	layer_mask_t layers);
 
 #endif /* _SECURITY_LANDLOCK_RULESET_H */
