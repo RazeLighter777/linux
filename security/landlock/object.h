@@ -62,14 +62,6 @@ struct landlock_object {
 	 * by @lock.  Cf. landlock_release_inodes() and release_inode().
 	 */
 	void *underobj;
-	/**
-	 * @no_inherit_desc_layers: Cache of layers for which a descendant rule
-	 * carries the no_inherit flag. This is a union of desc_layers from all
-	 * rulesets' xarray entries for this object. Protected by @lock.
-	 * This cache prevents xarray lookups on the hot path in
-	 * landlock_get_no_inherit_desc_layers().
-	 */
-	layer_mask_t no_inherit_desc_layers;
 	union {
 		/**
 		 * @rcu_free: Enables lockless use of @usage, @lock and

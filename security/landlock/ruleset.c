@@ -119,15 +119,6 @@ void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
 	if (!ruleset || !object || !layers)
 		return;
 
-	/*
-	 * Update the cache in the object. This cache is the union of all
-	 * desc_layers across all rulesets for this object, so we OR in the
-	 * new layers. The cache is protected by object->lock.
-	 */
-	spin_lock(&object->lock);
-	object->no_inherit_desc_layers |= layers;
-	spin_unlock(&object->lock);
-
 	desc = xa_load(&ruleset->no_inherit_desc, (unsigned long)object);
 	if (desc) {
 		desc->desc_layers |= layers;

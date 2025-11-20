@@ -466,6 +466,9 @@ SYSCALL_DEFINE4(landlock_add_rule, const int, ruleset_fd,
 	if (flags && flags & ~(LANDLOCK_ADD_RULE_QUIET | \
 		LANDLOCK_ADD_RULE_NO_INHERIT))
 		return -EINVAL;
+	if ((flags & LANDLOCK_ADD_RULE_NO_INHERIT) &&
+	    rule_type != LANDLOCK_RULE_PATH_BENEATH)
+		return -EINVAL;
 
 	/* Gets and checks the ruleset. */
 	ruleset = get_ruleset_from_fd(ruleset_fd, FMODE_CAN_WRITE);

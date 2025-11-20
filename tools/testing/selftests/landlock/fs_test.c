@@ -4495,10 +4495,42 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_dir)
 	/*
 	 * Content of the no-inherit directory is restricted by the rule (RO).
 	 */
-	ASSERT_EQ(-1, mknod(file1_s1d3, S_IFREG | 0700, 0));
-	ASSERT_EQ(EACCES, errno);
 	ASSERT_EQ(-1, unlink(file1_s1d3));
 	ASSERT_EQ(EACCES, errno);
+}
+
+TEST_F_FORK(layout1, inherit_no_inherit_topology_unrelated)
+{
+	const struct rule rules[] = {
+		{
+			.path = TMP_DIR,
+			.access = ACCESS_RW,
+		},
+		{},
+	};
+	static const char unrelated_dir[] = TMP_DIR "/s2d1/unrelated";
+	static const char unrelated_file[] = TMP_DIR "/s2d1/unrelated/f1";
+	int ruleset_fd;
+
+	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
+	ASSERT_LE(0, ruleset_fd);
+
+	/* Adds a no-inherit rule on a leaf directory unrelated to s2. */
+	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d3,
+			 LANDLOCK_ADD_RULE_NO_INHERIT);
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/* Ensure we can still create and delete files outside the sealed branch. */
+	ASSERT_EQ(0, mkdir(unrelated_dir, 0700));
+	ASSERT_EQ(0, mknod(unrelated_file, S_IFREG | 0600, 0));
+	ASSERT_EQ(0, unlink(unrelated_file));
+	ASSERT_EQ(0, rmdir(unrelated_dir));
+
+	/* Existing siblings in s2 remain modifiable. */
+	ASSERT_EQ(0, unlink(file1_s2d1));
+	ASSERT_EQ(0, mknod(file1_s2d1, S_IFREG | 0700, 0));
 }
 
 TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
@@ -4511,48 +4543,21 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 		{},
 	};
 	int ruleset_fd;
+	struct landlock_path_beneath_attr path_beneath = {
+		.allowed_access = ACCESS_RO,
+	};
 
 	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
 	ASSERT_LE(0, ruleset_fd);
 
-	/* Adds a no-inherit rule on a file. */
-	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, file1_s1d2,
-			 LANDLOCK_ADD_RULE_NO_INHERIT);
-
-	enforce_ruleset(_metadata, ruleset_fd);
+	path_beneath.parent_fd = open(file1_s1d2, O_PATH | O_CLOEXEC);
+	ASSERT_LE(0, path_beneath.parent_fd);
+	ASSERT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+				       &path_beneath,
+				       LANDLOCK_ADD_RULE_NO_INHERIT));
+	ASSERT_EQ(EINVAL, errno);
+	ASSERT_EQ(0, close(path_beneath.parent_fd));
 	ASSERT_EQ(0, close(ruleset_fd));
-
-	/*
-	 * Topology modifications of the rule path (file) and its parents are denied.
-	 */
-
-	/* Target file s1d2/f1 */
-	ASSERT_EQ(-1, unlink(file1_s1d2));
-	ASSERT_EQ(EACCES, errno);
-	ASSERT_EQ(-1, rename(file1_s1d2, file2_s1d2));
-	ASSERT_EQ(EACCES, errno);
-	ASSERT_EQ(-1, link(file1_s1d2, file1_s1d1));
-	ASSERT_EQ(EACCES, errno);
-
-	/* Parent directory s1d2 */
-	ASSERT_EQ(-1, rmdir(dir_s1d2));
-	ASSERT_EQ(EACCES, errno);
-	ASSERT_EQ(-1, rename(dir_s1d2, dir_s2d2));
-	ASSERT_EQ(EACCES, errno);
-
-	/* Grandparent directory s1d1 */
-	ASSERT_EQ(-1, rmdir(dir_s1d1));
-	ASSERT_EQ(EACCES, errno);
-	ASSERT_EQ(-1, rename(dir_s1d1, dir_s2d1));
-	ASSERT_EQ(EACCES, errno);
-
-	/*
-	 * Sibling operations are allowed.
-	 */
-	/* Sibling of f1 (f2) */
-	ASSERT_EQ(0, unlink(file2_s1d2));
-	/* Sibling of s1d2 */
-	ASSERT_EQ(0, unlink(file1_s1d1));
 }
 
 TEST_F_FORK(layout1, inherit_no_inherit_layered)
@@ -4565,37 +4570,44 @@ TEST_F_FORK(layout1, inherit_no_inherit_layered)
 		{},
 	};
 	int ruleset_fd;
+	static const char unrelated_dir[] = TMP_DIR "/s2d1/unrelated";
+	static const char unrelated_file[] = TMP_DIR "/s2d1/unrelated/f1";
 
+	/* Layer 1: RW on TMP_DIR */
 	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, layer1);
 	ASSERT_LE(0, ruleset_fd);
-
-	/* Layer 2: RO on s1d2, no inherit. */
-	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d2,
-			 LANDLOCK_ADD_RULE_NO_INHERIT);
-
 	enforce_ruleset(_metadata, ruleset_fd);
 	ASSERT_EQ(0, close(ruleset_fd));
 
-	/*
-	 * Topology locked for s1d2 and s1d1.
-	 */
-	ASSERT_EQ(-1, rmdir(dir_s1d2));
-	ASSERT_EQ(EACCES, errno);
-	ASSERT_EQ(-1, rmdir(dir_s1d1));
-	ASSERT_EQ(EACCES, errno);
+	/* Layer 2: Add no-inherit RO rule on s1d2 */
+	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, layer1);
+	ASSERT_LE(0, ruleset_fd);
+	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d2,
+			 LANDLOCK_ADD_RULE_NO_INHERIT);
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
 
-	/*
-	 * s1d2 content is restricted by Layer 2 (RO).
-	 */
+	/* Operations in unrelated areas should still work */
+	ASSERT_EQ(0, mkdir(unrelated_dir, 0700));
+	ASSERT_EQ(0, mknod(unrelated_file, S_IFREG | 0600, 0));
+	ASSERT_EQ(0, unlink(unrelated_file));
+	ASSERT_EQ(0, rmdir(unrelated_dir));
+
+	/* Creating in s1d1 should be allowed (parent still has RW) */
+	ASSERT_EQ(0, mknod(TMP_DIR "/s1d1/newfile", S_IFREG | 0600, 0));
+	ASSERT_EQ(0, unlink(TMP_DIR "/s1d1/newfile"));
+
+	/* Content of s1d2 should be read-only */
 	ASSERT_EQ(-1, unlink(file1_s1d2));
 	ASSERT_EQ(EACCES, errno);
 
-	/*
-	 * s1d3 (child of s1d2) should NOT be restricted by Layer 2 because of NO_INHERIT.
-	 * It should fall back to Layer 1 (RW).
-	 */
-	ASSERT_EQ(0, unlink(file1_s1d3));
-	ASSERT_EQ(0, mknod(file1_s1d3, S_IFREG | 0700, 0));
+	/* Topology changes to s1d2 should be denied */
+	ASSERT_EQ(-1, rename(dir_s1d2, TMP_DIR "/s2d1/renamed"));
+	ASSERT_EQ(EACCES, errno);
+
+	/* Renaming s1d1 should also be denied (it's an ancestor) */
+	ASSERT_EQ(-1, rename(dir_s1d1, TMP_DIR "/s2d1/renamed"));
+	ASSERT_EQ(EACCES, errno);
 }
 
 /* clang-format off */
