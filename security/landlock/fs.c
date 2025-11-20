@@ -2094,7 +2094,7 @@ static int hook_path_unlink(const struct path *const dir,
 	const struct landlock_cred_security *const subject =
 		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
 	int err;
-	
+
 	if (subject) {
 		err = deny_no_inherit_topology_change(subject, dentry);
 		if (err)
@@ -2155,6 +2155,7 @@ get_required_file_open_access(const struct file *const file)
 
 static void build_check_file_security(void)
 {
+#ifdef CONFIG_AUDIT
 	const struct landlock_file_security file_sec = {
 		.quiet_optional_accesses = ~0,
 		.fown_layer = ~0,
@@ -2171,6 +2172,7 @@ static void build_check_file_security(void)
 		     __const_hweight64(_LANDLOCK_ACCESS_FS_OPTIONAL));
 	/* Makes sure all layers can be identified. */
 	BUILD_BUG_ON(file_sec.fown_layer < LANDLOCK_MAX_NUM_LAYERS - 1);
+#endif /* CONFIG_AUDIT */
 }
 
 static int hook_file_alloc_security(struct file *const file)
