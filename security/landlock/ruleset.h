@@ -15,7 +15,6 @@
 #include <linux/rbtree.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
-#include <linux/xarray.h>
 
 #include "access.h"
 #include "limits.h"
@@ -158,11 +157,6 @@ struct landlock_rule {
 	struct landlock_layer layers[] __counted_by(num_layers);
 };
 
-struct landlock_no_inherit_desc {
-	struct landlock_object *object;
-	layer_mask_t desc_layers;
-};
-
 /**
  * struct landlock_ruleset - Landlock ruleset
  *
@@ -214,12 +208,6 @@ struct landlock_ruleset {
 			 */
 			refcount_t usage;
 
-			/**
-			 * @no_inherit_desc: XArray containing objects
-			 * with no_inherit descendants in this ruleset.
-			 * This is used to quickly merge no_inherit flags,
-			 */
-			struct xarray no_inherit_desc;
 			/**
 			 * @num_rules: Number of non-overlapping (i.e. not for
 			 * the same object) rules in this ruleset.
@@ -378,11 +366,5 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 			  const access_mask_t access_request,
 			  layer_mask_t (*const layer_masks)[],
 			  const enum landlock_key_type key_type);
-
-
-
-void landlock_set_no_inherit_desc_layers(struct landlock_ruleset *ruleset,
-	struct landlock_object *object,
-	layer_mask_t layers);
 
 #endif /* _SECURITY_LANDLOCK_RULESET_H */
