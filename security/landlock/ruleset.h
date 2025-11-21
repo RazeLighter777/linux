@@ -213,16 +213,17 @@ struct landlock_ruleset {
 			 * descriptors referencing this ruleset.
 			 */
 			refcount_t usage;
-			/**
-			 * @num_rules: Number of non-overlapping (i.e. not for
-			 * the same object) rules in this ruleset.
-			 */
+
 			/**
 			 * @no_inherit_desc: XArray containing objects
 			 * with no_inherit descendants in this ruleset.
 			 * This is used to quickly merge no_inherit flags,
 			 */
 			struct xarray no_inherit_desc;
+			/**
+			 * @num_rules: Number of non-overlapping (i.e. not for
+			 * the same object) rules in this ruleset.
+			 */
 			u32 num_rules;
 			/**
 			 * @num_layers: Number of layers that are used in this

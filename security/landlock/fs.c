@@ -499,18 +499,6 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 					      descendant_layers);
 		}
 	}
-
-	/*
-	 * Register this object in the xarray even if it doesn't currently have
-	 * descendant no-inherit layers, so collect_no_inherit_layers() can walk
-	 * ancestors reliably when checking topology changes.
-	 */
-	if (!err) {
-		const struct landlock_rule *rule = find_rule(ruleset, path->dentry);
-
-		if (rule)
-			landlock_set_no_inherit_desc_layers(ruleset, id.key.object, 0);
-	}
 	mutex_unlock(&ruleset->lock);
 	/*
 	 * No need to check for an error because landlock_insert_rule()
