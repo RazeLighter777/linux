@@ -135,6 +135,9 @@ struct landlock_ruleset_attr {
  *     from parent objects, meaning that if a parent directory has been granted
  *     certain access rights, those rights will also apply to its child objects.
  *     This flag prevents such inheritance for the specific rule being added.
+ *     This flag also prevents refer and removal operations in the direct parent
+ *     hierarchy of the object covered by this rule, unless those operations are
+ *     explicitly allowed by other rules in the same layer.
  */
 
 /* clang-format off */

@@ -344,6 +344,30 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
 	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+<<<<<<< HEAD
+=======
+	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
+		const struct landlock_rule *rule;
+		layer_mask_t descendant_layers = 0;
+		u32 layer_index;
+
+		rule = find_rule(ruleset, path->dentry);
+		if (rule) {
+			for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
+				const struct landlock_layer *layer =
+					&rule->layers[layer_index];
+
+				if (layer->flags.no_inherit ||
+				    layer->flags.has_no_inherit_descendant)
+					descendant_layers |=
+						landlock_layer_bit(layer, layer_index);
+			}
+			if (descendant_layers)
+				mark_no_inherit_ancestors(ruleset, path->dentry,
+					      descendant_layers);
+		}
+	}
+>>>>>>> 58e1a016eeaf (removes some uneccesarry code and fixes the comment that I misplaced)
 	mutex_unlock(&ruleset->lock);
 	/*
 	 * No need to check for an error because landlock_insert_rule()
