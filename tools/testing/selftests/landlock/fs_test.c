@@ -4533,6 +4533,51 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_unrelated)
 	ASSERT_EQ(0, mknod(file1_s2d1, S_IFREG | 0700, 0));
 }
 
+TEST_F_FORK(layout1, inherit_no_inherit_descendant_rw)
+{
+	const struct rule rules[] = {
+		{
+			.path = TMP_DIR,
+			.access = ACCESS_RO,
+		},
+		{},
+	};
+	const __u64 handled_access = ACCESS_RW |
+				          LANDLOCK_ACCESS_FS_MAKE_REG |
+				          LANDLOCK_ACCESS_FS_REMOVE_FILE;
+	static const char child_file[] =
+		TMP_DIR "/s1d1/s1d2/s1d3/rw_descendant";
+	int ruleset_fd;
+
+	/* Clean up leftovers from previous runs if any. */
+	{
+		int ret = unlink(child_file);
+		int saved_errno = errno;
+
+		ASSERT_FALSE(ret && saved_errno != ENOENT)
+		{
+			TH_LOG("Failed to clean %s: %s", child_file,
+			       strerror(saved_errno));
+		}
+	}
+
+	ruleset_fd = create_ruleset(_metadata, handled_access, rules);
+	ASSERT_LE(0, ruleset_fd);
+
+	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d2,
+			LANDLOCK_ADD_RULE_NO_INHERIT);
+	add_path_beneath(_metadata, ruleset_fd,
+			ACCESS_RW | LANDLOCK_ACCESS_FS_MAKE_REG |
+				LANDLOCK_ACCESS_FS_REMOVE_FILE,
+			dir_s1d3, 0);
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	ASSERT_EQ(0, mknod(child_file, S_IFREG | 0600, 0));
+	ASSERT_EQ(0, unlink(child_file));
+}
+
 TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 {
 	const struct rule rules[] = {
