@@ -775,6 +775,9 @@ static bool is_access_to_paths_allowed(
 		_layer_masks_parent2_bkp[LANDLOCK_NUM_ACCESS_FS];
 	layer_mask_t(*layer_masks_child1)[LANDLOCK_NUM_ACCESS_FS] = NULL,
 	(*layer_masks_child2)[LANDLOCK_NUM_ACCESS_FS] = NULL;
+	struct collected_rule_flags *rule_flags_parent1 = &log_request_parent1->rule_flags;
+	struct collected_rule_flags *rule_flags_parent2 = &log_request_parent2->rule_flags;
+	struct collected_rule_flags _rule_flag_parent1_bkp, _rule_flag_parent2_bkp;
 
 	if (!access_request_parent1 && !access_request_parent2)
 		return true;
@@ -800,6 +803,8 @@ static bool is_access_to_paths_allowed(
 		 */
 		memcpy(&_layer_masks_parent2_bkp, layer_masks_parent2,
 		       sizeof(_layer_masks_parent2_bkp));
+		memcpy(&_rule_flag_parent2_bkp, rule_flags_parent2,
+		       sizeof(_rule_flag_parent2_bkp));
 		allowed_parent2 = is_layer_masks_allowed(layer_masks_parent2);
 
 		/*
@@ -826,26 +831,38 @@ static bool is_access_to_paths_allowed(
 	 */
 	memcpy(&_layer_masks_parent1_bkp, layer_masks_parent1,
 	       sizeof(_layer_masks_parent1_bkp));
+	memcpy(&_rule_flag_parent1_bkp, rule_flags_parent1,
+	       sizeof(_rule_flag_parent1_bkp));
 	allowed_parent1 = is_layer_masks_allowed(layer_masks_parent1);
 	is_dom_check_bkp = is_dom_check;
 
 	if (unlikely(dentry_child1)) {
+		/*
+		 * Get the layer masks for the child dentries for use by domain
+		 * check later.  The rule_flags for child1 should have been
+		 * included in rule_flags_parent1 already (cf.
+		 * collect_domain_accesses), and is not relevant for domain check,
+		 * so we don't have to pass it to landlock_unmask_layers.
+		 */
 		landlock_unmask_layers(
 			find_rule(domain, dentry_child1),
 			landlock_init_layer_masks(
 				domain, LANDLOCK_MASK_ACCESS_FS,
 				&_layer_masks_child1, LANDLOCK_KEY_INODE),
-			&_layer_masks_child1, ARRAY_SIZE(_layer_masks_child1));
+			&_layer_masks_child1, ARRAY_SIZE(_layer_masks_child1),
+			NULL);
 		layer_masks_child1 = &_layer_masks_child1;
 		child1_is_directory = d_is_dir(dentry_child1);
 	}
 	if (unlikely(dentry_child2)) {
+		/* See above comment for why NULL is passed as rule_flags_masks. */
 		landlock_unmask_layers(
 			find_rule(domain, dentry_child2),
 			landlock_init_layer_masks(
 				domain, LANDLOCK_MASK_ACCESS_FS,
 				&_layer_masks_child2, LANDLOCK_KEY_INODE),
-			&_layer_masks_child2, ARRAY_SIZE(_layer_masks_child2));
+			&_layer_masks_child2, ARRAY_SIZE(_layer_masks_child2),
+			NULL);
 		layer_masks_child2 = &_layer_masks_child2;
 		child2_is_directory = d_is_dir(dentry_child2);
 	}
@@ -901,16 +918,18 @@ static bool is_access_to_paths_allowed(
 			       NULL :
 			       find_rule(domain, walker_path.dentry);
 
-		allowed_parent1 = allowed_parent1 ||
-				  landlock_unmask_layers(
-					  rule, access_masked_parent1,
-					  layer_masks_parent1,
-					  ARRAY_SIZE(*layer_masks_parent1));
-		allowed_parent2 = allowed_parent2 ||
-				  landlock_unmask_layers(
-					  rule, access_masked_parent2,
-					  layer_masks_parent2,
-					  ARRAY_SIZE(*layer_masks_parent2));
+		allowed_parent1 =
+			allowed_parent1 ||
+			landlock_unmask_layers(rule, access_masked_parent1,
+					       layer_masks_parent1,
+					       ARRAY_SIZE(*layer_masks_parent1),
+					       rule_flags_parent1);
+		allowed_parent2 =
+			allowed_parent2 ||
+			landlock_unmask_layers(rule, access_masked_parent2,
+					       layer_masks_parent2,
+					       ARRAY_SIZE(*layer_masks_parent2),
+					       rule_flags_parent2);
 
 		/* Stops when a rule from each layer grants access. */
 		if (allowed_parent1 && allowed_parent2) {
@@ -947,10 +966,16 @@ jump_up:
 				memcpy(&_layer_masks_parent1_bkp,
 				       layer_masks_parent1,
 				       sizeof(_layer_masks_parent1_bkp));
+				memcpy(&_rule_flag_parent1_bkp,
+				       rule_flags_parent1,
+				       sizeof(_rule_flag_parent1_bkp));
 				if (layer_masks_parent2) {
 					memcpy(&_layer_masks_parent2_bkp,
 					       layer_masks_parent2,
 					       sizeof(_layer_masks_parent2_bkp));
+					memcpy(&_rule_flag_parent2_bkp,
+					       rule_flags_parent2,
+					       sizeof(_rule_flag_parent2_bkp));
 					is_dom_check_bkp = is_dom_check;
 				}
 
@@ -999,11 +1024,15 @@ reset_to_mount_root:
 		 */
 		memcpy(layer_masks_parent1, &_layer_masks_parent1_bkp,
 		       sizeof(_layer_masks_parent1_bkp));
+		memcpy(rule_flags_parent1, &_rule_flag_parent1_bkp,
+		       sizeof(_rule_flag_parent1_bkp));
 		allowed_parent1 =
 			is_layer_masks_allowed(&_layer_masks_parent1_bkp);
 		if (layer_masks_parent2) {
 			memcpy(layer_masks_parent2, &_layer_masks_parent2_bkp,
 			       sizeof(_layer_masks_parent2_bkp));
+			memcpy(rule_flags_parent2, &_rule_flag_parent2_bkp,
+			       sizeof(_rule_flag_parent2_bkp));
 			allowed_parent2 = is_layer_masks_allowed(
 				&_layer_masks_parent2_bkp);
 
@@ -1139,7 +1168,8 @@ static access_mask_t maybe_remove(const struct dentry *const dentry)
 static bool collect_domain_accesses(
 	const struct landlock_ruleset *const domain,
 	const struct path *const mnt_dir, struct dentry *dir,
-	layer_mask_t (*const layer_masks_dom)[LANDLOCK_NUM_ACCESS_FS])
+	layer_mask_t (*const layer_masks_dom)[LANDLOCK_NUM_ACCESS_FS],
+	struct collected_rule_flags *const rule_flags)
 {
 	access_mask_t access_dom;
 	bool ret = false;
@@ -1158,9 +1188,9 @@ static bool collect_domain_accesses(
 		struct dentry *parent_dentry;
 
 		/* Gets all layers allowing all domain accesses. */
-		if (landlock_unmask_layers(find_rule(domain, dir), access_dom,
-					   layer_masks_dom,
-					   ARRAY_SIZE(*layer_masks_dom))) {
+		if (landlock_unmask_layers(
+			    find_rule(domain, dir), access_dom, layer_masks_dom,
+			    ARRAY_SIZE(*layer_masks_dom), rule_flags)) {
 			/*
 			 * Before allowing this side of the access request, checks that the
 			 * walk was not in a disconnected directory.
@@ -1327,11 +1357,14 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 						      old_dentry->d_parent;
 
 	/* new_dir->dentry is equal to new_dentry->d_parent */
-	allow_parent1 = collect_domain_accesses(
-		subject->domain, &mnt_dir, old_parent, &layer_masks_parent1);
+	allow_parent1 = collect_domain_accesses(subject->domain, &mnt_dir,
+						old_parent,
+						&layer_masks_parent1,
+						&request1.rule_flags);
 	allow_parent2 = collect_domain_accesses(subject->domain, &mnt_dir,
 						new_dir->dentry,
-						&layer_masks_parent2);
+						&layer_masks_parent2,
+						&request2.rule_flags);
 	if (allow_parent1 && allow_parent2)
 		return 0;
 
