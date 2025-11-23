@@ -332,9 +332,7 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 			    const access_mask_t access_request,
 			    layer_mask_t (*const layer_masks)[],
 			    const size_t masks_array_size,
-			    struct collected_rule_flags *const rule_flags);
-
-access_mask_t
+			    struct collected_rule_flags *const rule_flags);access_mask_t
 landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 			  const access_mask_t access_request,
 			  layer_mask_t (*const layer_masks)[],
