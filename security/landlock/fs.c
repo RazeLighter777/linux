@@ -1511,10 +1511,10 @@ cancel_walk:
 	return ret;
 }
 
-static layer_mask_t collect_topology_sealed_layers(
-	const struct landlock_ruleset *const domain,
-	struct dentry *dentry,
-	layer_mask_t *const override_layers)
+static layer_mask_t
+collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
+			       struct dentry *dentry,
+			       layer_mask_t *const override_layers)
 {
 	struct dentry *cursor, *parent;
 	bool include_descendants = true;
@@ -1537,12 +1537,12 @@ static layer_mask_t collect_topology_sealed_layers(
 			     layer_index++) {
 				const struct landlock_layer *layer =
 					&rule->layers[layer_index];
-				layer_mask_t layer_bit = BIT_ULL(
-					(layer->level ? layer->level :
-					 layer_index + 1) - 1);
+				const int level = layer->level ? layer->level :
+								 layer_index + 1;
+				layer_mask_t layer_bit = BIT_ULL(level - 1);
 
-				if (layer->flags.no_inherit ||
-				    (include_descendants &&
+				if (include_descendants &&
+				    (layer->flags.no_inherit ||
 				     layer->flags.has_no_inherit_descendant)) {
 					sealed_layers |= layer_bit;
 				} else if (override_layers) {
@@ -1578,7 +1578,7 @@ static int deny_no_inherit_topology_change(
 		return 0;
 
 	sealed_layers = collect_topology_sealed_layers(subject->domain, dentry,
-						      &override_layers);
+						       &override_layers);
 	sealed_layers &= ~override_layers;
 	if (!sealed_layers)
 		return 0;

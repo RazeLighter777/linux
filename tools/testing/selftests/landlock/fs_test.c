@@ -4446,13 +4446,15 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_dir)
 	const struct rule rules[] = {
 		{
 			.path = TMP_DIR,
-			.access = ACCESS_RW,
+			.access = ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
 		},
 		{},
 	};
 	int ruleset_fd;
 
-	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
+	ruleset_fd = create_ruleset(_metadata,
+				    ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+				    rules);
 	ASSERT_LE(0, ruleset_fd);
 
 	/* Adds a no-inherit rule on a leaf directory. */
@@ -4499,6 +4501,39 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_dir)
 	ASSERT_EQ(EACCES, errno);
 }
 
+TEST_F_FORK(layout1, no_inherit_allow_inner_removal)
+{
+	int ruleset_fd;
+	struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_fs = ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+	};
+
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
+
+	add_path_beneath(_metadata, ruleset_fd,
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE, dir_s1d2,
+			 LANDLOCK_ADD_RULE_NO_INHERIT);
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * Content of the no-inherit directory is mutable (RW).
+	 * This checks that the no-inherit flag does not seal the content.
+	 */
+	ASSERT_EQ(0, unlink(file1_s1d2));
+
+	/*
+	 * Topology modifications of the rule path are denied.
+	 */
+	ASSERT_EQ(-1, rmdir(dir_s1d2));
+	ASSERT_EQ(EACCES, errno);
+	ASSERT_EQ(-1, rename(dir_s1d2, dir_s2d2));
+	ASSERT_EQ(EACCES, errno);
+}
+
 TEST_F_FORK(layout1, inherit_no_inherit_topology_unrelated)
 {
 	const struct rule rules[] = {
@@ -4542,9 +4577,8 @@ TEST_F_FORK(layout1, inherit_no_inherit_descendant_rw)
 		},
 		{},
 	};
-	const __u64 handled_access = ACCESS_RW |
-				          LANDLOCK_ACCESS_FS_MAKE_REG |
-				          LANDLOCK_ACCESS_FS_REMOVE_FILE;
+	const __u64 handled_access = ACCESS_RW | LANDLOCK_ACCESS_FS_MAKE_REG |
+				     LANDLOCK_ACCESS_FS_REMOVE_FILE;
 	static const char child_file[] =
 		TMP_DIR "/s1d1/s1d2/s1d3/rw_descendant";
 	int ruleset_fd;
@@ -4565,11 +4599,11 @@ TEST_F_FORK(layout1, inherit_no_inherit_descendant_rw)
 	ASSERT_LE(0, ruleset_fd);
 
 	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d2,
-			LANDLOCK_ADD_RULE_NO_INHERIT);
+			 LANDLOCK_ADD_RULE_NO_INHERIT);
 	add_path_beneath(_metadata, ruleset_fd,
-			ACCESS_RW | LANDLOCK_ACCESS_FS_MAKE_REG |
-				LANDLOCK_ACCESS_FS_REMOVE_FILE,
-			dir_s1d3, 0);
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_MAKE_REG |
+				 LANDLOCK_ACCESS_FS_REMOVE_FILE,
+			 dir_s1d3, 0);
 
 	enforce_ruleset(_metadata, ruleset_fd);
 	ASSERT_EQ(0, close(ruleset_fd));
@@ -4610,7 +4644,7 @@ TEST_F_FORK(layout1, inherit_no_inherit_layered)
 	const struct rule layer1[] = {
 		{
 			.path = TMP_DIR,
-			.access = ACCESS_RW,
+			.access = ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
 		},
 		{},
 	};
@@ -4619,13 +4653,17 @@ TEST_F_FORK(layout1, inherit_no_inherit_layered)
 	static const char unrelated_file[] = TMP_DIR "/s2d1/unrelated/f1";
 
 	/* Layer 1: RW on TMP_DIR */
-	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, layer1);
+	ruleset_fd = create_ruleset(_metadata,
+				    ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+				    layer1);
 	ASSERT_LE(0, ruleset_fd);
 	enforce_ruleset(_metadata, ruleset_fd);
 	ASSERT_EQ(0, close(ruleset_fd));
 
 	/* Layer 2: Add no-inherit RO rule on s1d2 */
-	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, layer1);
+	ruleset_fd = create_ruleset(_metadata,
+				    ACCESS_RW | LANDLOCK_ACCESS_FS_REMOVE_FILE,
+				    layer1);
 	ASSERT_LE(0, ruleset_fd);
 	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d2,
 			 LANDLOCK_ADD_RULE_NO_INHERIT);
