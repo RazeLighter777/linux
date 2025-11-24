@@ -7454,9 +7454,9 @@ TEST_F(audit_layout1, no_inherit_parent_is_logged)
 					      sizeof(ruleset_attr), 0);
 	ASSERT_LE(0, ruleset_fd);
 
-	/* Base read-only rule at /a. */
+	/* Base read-only rule at s1d1. */
 	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d1, 0);
-	/* Descendant /a/b/c forbids inheritance but should still log. */
+	/* Descendant s1d1/s1d2/s1d3 forbids inheritance but should still log. */
 	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, dir_s1d3,
 			LANDLOCK_ADD_RULE_NO_INHERIT);
 

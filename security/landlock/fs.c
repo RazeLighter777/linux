@@ -621,7 +621,7 @@ find_rule(const struct landlock_ruleset *const domain,
  * This is useful for LANDLOCK_ADD_RULE_NO_INHERIT processing, where a rule
  * may need to be created for an ancestor dentry that does not yet have one
  * to properly track no_inherit flags.
- * 
+ *
  * The flags are set to zero if a rule is newly created, and the caller
  * is responsible for setting them appropriately.
  *
@@ -698,7 +698,9 @@ static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 
 		if (!d_is_negative(parent)) {
 			const struct landlock_rule *rule;
-			/* Ensures a rule exists for the parent dentry, inserting a blank one if needed */
+			/* Ensures a rule exists for the parent dentry,
+			 * inserting a blank one if needed
+			 */
 			rule = ensure_rule_for_dentry(ruleset, parent);
 			if (rule) {
 				struct landlock_rule *mutable_rule =
@@ -1653,7 +1655,7 @@ cancel_walk:
  * Returns a layer mask where set bits indicate layers that are "sealed"
  * (topology changes like rename/rmdir are denied) for the subtree rooted at
  * @dentry.
- * 
+ *
  * Useful for LANDLOCK_ADD_RULE_NO_INHERIT parent directory enforcement to ensure
  * that topology changes do not violate the no_inherit constraints.
  */
@@ -1711,6 +1713,7 @@ collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
 	dput(cursor);
 	return sealed_layers;
 }
+
 /**
  * deny_no_inherit_topology_change - deny topology changes on sealed layers
  * @subject: Subject performing the operation (contains the domain).
