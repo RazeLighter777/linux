@@ -323,13 +323,52 @@ static const struct landlock_rule *find_rule(
 	const struct landlock_ruleset *const domain,
 	const struct dentry *const dentry);
 
+static layer_mask_t landlock_domain_layers_mask(
+	const struct landlock_ruleset *const domain)
+{
+	if (!domain || !domain->num_layers)
+		return 0;
+
+	if (domain->num_layers >= sizeof(layer_mask_t) * BITS_PER_BYTE)
+		return (layer_mask_t)~0ULL;
+
+	return GENMASK_ULL(domain->num_layers - 1, 0);
+}
+
+static bool rule_blocks_all_layers_no_inherit(
+	const layer_mask_t domain_layers_mask,
+	const struct landlock_rule *const rule)
+{
+	layer_mask_t rule_layers = 0;
+	u32 layer_index;
+
+	if (!domain_layers_mask || !rule)
+		return false;
+
+	for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
+		const struct landlock_layer *const layer =
+			&rule->layers[layer_index];
+		const layer_mask_t layer_bit = BIT_ULL(layer->level - 1);
+
+		if (!layer->flags.no_inherit)
+			return false;
+
+		rule_layers |= layer_bit;
+	}
+
+	return rule_layers && rule_layers == domain_layers_mask;
+}
+
+/**
+ * landlock_collect_no_inherit_layers - Collects layers with no_inherit flags
+ */
 static layer_mask_t landlock_collect_no_inherit_layers(
 	const struct landlock_ruleset *const ruleset,
-	struct dentry *const dentry,
-	bool include_descendants)
+	struct dentry *const dentry)
 {
 	struct dentry *cursor, *parent;
 	layer_mask_t layers = 0;
+	bool include_descendants = true;
 
 	if (!ruleset || !dentry || d_is_negative(dentry))
 		return 0;
@@ -394,7 +433,7 @@ static bool mask_no_inherit_descendant_layers(
 	if (d_is_negative(dentry))
 		return false;
 
-	descendant_layers = landlock_collect_no_inherit_layers(domain, dentry, true);
+	descendant_layers = landlock_collect_no_inherit_layers(domain, dentry);
 	{
 		layer_mask_t shared_layers = descendant_layers & child_layers;
 
@@ -988,6 +1027,8 @@ static bool is_access_to_paths_allowed(
 	struct landlock_request *const log_request_parent2,
 	struct dentry *const dentry_child2)
 {
+	const layer_mask_t domain_layers_mask =
+		landlock_domain_layers_mask(domain);
 	bool allowed_parent1 = false, allowed_parent2 = false, is_dom_check,
 	     is_dom_check_bkp, child1_is_directory = true,
 	     child2_is_directory = true;
@@ -1006,9 +1047,9 @@ static bool is_access_to_paths_allowed(
 	layer_mask_t child2_layers = 0;
 
 	if (dentry_child1)
-		child1_layers = landlock_collect_no_inherit_layers(domain, dentry_child1, true);
+		child1_layers = landlock_collect_no_inherit_layers(domain, dentry_child1);
 	if (dentry_child2)
-		child2_layers = landlock_collect_no_inherit_layers(domain, dentry_child2, true);
+		child2_layers = landlock_collect_no_inherit_layers(domain, dentry_child2);
 
 	if (!access_request_parent1 && !access_request_parent2)
 		return true;
@@ -1162,6 +1203,10 @@ static bool is_access_to_paths_allowed(
 					       ARRAY_SIZE(*layer_masks_parent2),
 					       rule_flags_parent2);
 
+		if (rule &&
+		    rule_blocks_all_layers_no_inherit(domain_layers_mask, rule))
+			break;
+
 		/* Stops when a rule from each layer grants access. */
 		if (allowed_parent1 && allowed_parent2) {
 			/*
@@ -1210,7 +1255,7 @@ jump_up:
 				}
 				is_dom_check_bkp = is_dom_check;
 				child1_layers = landlock_collect_no_inherit_layers(
-					domain, walker_path.dentry, true);
+					domain, walker_path.dentry);
 				if (layer_masks_parent2)
 					child2_layers = child1_layers;
 
@@ -1244,7 +1289,7 @@ jump_up:
 	}
 	if (likely(!d_is_negative(walker_path.dentry))) {
 		child1_layers = landlock_collect_no_inherit_layers(
-			domain, walker_path.dentry, true);
+			domain, walker_path.dentry);
 		if (layer_masks_parent2)
 			child2_layers = child1_layers;
 	} else {
@@ -1326,7 +1371,7 @@ reset_to_mount_root:
 		walker_path.dentry = walker_path.mnt->mnt_root;
 		dget(walker_path.dentry);
 		child1_layers = landlock_collect_no_inherit_layers(
-			domain, walker_path.dentry, true);
+			domain, walker_path.dentry);
 		if (layer_masks_parent2)
 			child2_layers = child1_layers;
 	}
@@ -1444,6 +1489,8 @@ static bool collect_domain_accesses(
 	struct collected_rule_flags *const rule_flags)
 {
 	access_mask_t access_dom;
+	const layer_mask_t domain_layers_mask =
+		landlock_domain_layers_mask(domain);
 	bool ret = false;
 
 	if (WARN_ON_ONCE(!domain || !mnt_dir || !dir || !layer_masks_dom))
@@ -1459,9 +1506,11 @@ static bool collect_domain_accesses(
 	while (true) {
 		struct dentry *parent_dentry;
 
+		const struct landlock_rule *rule = find_rule(domain, dir);
+
 		/* Gets all layers allowing all domain accesses. */
 		if (landlock_unmask_layers(
-			    find_rule(domain, dir), access_dom, layer_masks_dom,
+			    rule, access_dom, layer_masks_dom,
 			    ARRAY_SIZE(*layer_masks_dom), rule_flags)) {
 			/*
 			 * Before allowing this side of the access request, checks that the
@@ -1477,6 +1526,10 @@ static bool collect_domain_accesses(
 			ret = true;
 			break;
 		}
+
+		if (rule &&
+		    rule_blocks_all_layers_no_inherit(domain_layers_mask, rule))
+			break;
 
 		/* Stops at the mount point. */
 		if (dir == mnt_dir->dentry)

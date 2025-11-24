@@ -138,6 +138,12 @@ struct landlock_ruleset_attr {
  *     This flag also prevents refer and removal operations in the direct parent
  *     hierarchy of the object covered by this rule, unless those operations are
  *     explicitly allowed by other rules in the same layer.
+ *     
+ *     This flag also blocks the inheritance of "quiet" flags from parent layers.
+ *     In the future if other flags with inheritance properties are added, this flag
+ *     will also block their inheritance, too, if doing so is safe.
+ * 
+ * 
  */
 
 /* clang-format off */

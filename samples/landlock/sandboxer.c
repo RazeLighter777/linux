@@ -136,7 +136,7 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 	env_path_name = getenv(env_var);
 	if (!env_path_name) {
 		if (mandatory) {
-			/* Prevents users to forget a setting. */
+			/* Prevents from forgetting to set necessary env vars. */
 			fprintf(stderr, "Missing environment variable %s\n",
 				env_var);
 			return 1;
