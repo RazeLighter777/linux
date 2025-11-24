@@ -76,12 +76,17 @@ struct collected_rule_flags {
 	*/
 	layer_mask_t no_inherit_masks;
 	/**
-	 * @has_no_inherit_descendant_masks: Layers for which the
+	 * @no_inherit_desc_masks: Layers for which the
 	 * has_no_inherit_descendant "flag" is effective.
 	 * This is not a flag of the rule itself, but a marker set on ancestors
 	 * of rules with the no_inherit flag.
 	 */
 	layer_mask_t no_inherit_desc_masks;
+	/**
+	 * @blocked_flag_layers: Layers where flag inheritance must be blocked
+	 * because of a no_inherit rule.
+	 */
+	layer_mask_t blocked_flag_layers;
 };
 
 /**

@@ -675,7 +675,8 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 			continue;
 
 		/* Collect rule flags for each layer. */
-		if (rule_flags && layer->flags.quiet)
+		if (rule_flags && layer->flags.quiet &&
+		    !(rule_flags->blocked_flag_layers & layer_bit))
 			rule_flags->quiet_masks |= layer_bit;
 		if (rule_flags && layer->flags.no_inherit)
 			rule_flags->no_inherit_masks |= layer_bit;
