@@ -58,6 +58,8 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 
 #define ENV_FS_RO_NAME "LL_FS_RO"
 #define ENV_FS_RW_NAME "LL_FS_RW"
+#define ENV_FS_RO_NO_INHERIT_NAME "LL_FS_RO_NO_INHERIT"
+#define ENV_FS_RW_NO_INHERIT_NAME "LL_FS_RW_NO_INHERIT"
 #define ENV_FS_QUIET_NAME "LL_FS_QUIET"
 #define ENV_FS_QUIET_ACCESS_NAME "LL_FS_QUIET_ACCESS"
 #define ENV_TCP_BIND_NAME "LL_TCP_BIND"
@@ -121,7 +123,8 @@ static int parse_path(char *env_path, const char ***const path_list)
 /* clang-format on */
 
 static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
-			       const __u64 allowed_access, bool quiet)
+		       const __u64 allowed_access,
+		       __u32 add_rule_flags, bool mandatory)
 {
 	int num_paths, i, ret = 1;
 	char *env_path_name;
@@ -132,9 +135,13 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 
 	env_path_name = getenv(env_var);
 	if (!env_path_name) {
-		/* Prevents users to forget a setting. */
-		fprintf(stderr, "Missing environment variable %s\n", env_var);
-		return 1;
+		if (mandatory) {
+			/* Prevents from forgetting to set necessary env vars. */
+			fprintf(stderr, "Missing environment variable %s\n",
+				env_var);
+			return 1;
+		}
+		return 0;
 	}
 	env_path_name = strdup(env_path_name);
 	unsetenv(env_var);
@@ -171,8 +178,7 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 		if (!S_ISDIR(statbuf.st_mode))
 			path_beneath.allowed_access &= ACCESS_FILE;
 		if (landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-				      &path_beneath,
-				      quiet ? LANDLOCK_ADD_RULE_QUIET : 0)) {
+			      &path_beneath, add_rule_flags)) {
 			fprintf(stderr,
 				"Failed to update the ruleset with \"%s\": %s\n",
 				path_list[i], strerror(errno));
@@ -375,6 +381,8 @@ static const char help[] =
 	"Optional settings (when not set, their associated access check "
 	"is always allowed, which is different from an empty string which "
 	"means an empty list):\n"
+	"* " ENV_FS_RO_NO_INHERIT_NAME ": read-only paths without rule inheritance\n"
+	"* " ENV_FS_RW_NO_INHERIT_NAME ": read-write paths without rule inheritance\n"
 	"* " ENV_TCP_BIND_NAME ": ports allowed to bind (server)\n"
 	"* " ENV_TCP_CONNECT_NAME ": ports allowed to connect (client)\n"
 	"* " ENV_SCOPED_NAME ": actions denied on the outside of the landlock domain\n"
@@ -596,17 +604,28 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	}
 
 	if (populate_ruleset_fs(ENV_FS_RO_NAME, ruleset_fd, access_fs_ro,
-				false)) {
+			0, true)) {
 		goto err_close_ruleset;
 	}
 	if (populate_ruleset_fs(ENV_FS_RW_NAME, ruleset_fd, access_fs_rw,
+			0, true)) {
+		goto err_close_ruleset;
+	}
+	/* Optional no-inherit rules mirror the regular read-only/read-write sets. */
+	if (populate_ruleset_fs(ENV_FS_RO_NO_INHERIT_NAME, ruleset_fd,
+				access_fs_ro, LANDLOCK_ADD_RULE_NO_INHERIT,
+				false)) {
+		goto err_close_ruleset;
+	}
+	if (populate_ruleset_fs(ENV_FS_RW_NO_INHERIT_NAME, ruleset_fd,
+				access_fs_rw, LANDLOCK_ADD_RULE_NO_INHERIT,
 				false)) {
 		goto err_close_ruleset;
 	}
 	/* Don't require this env to be present. */
-	if (quiet_supported && getenv(ENV_FS_QUIET_NAME)) {
+	if (quiet_supported) {
 		if (populate_ruleset_fs(ENV_FS_QUIET_NAME, ruleset_fd, 0,
-					true)) {
+				LANDLOCK_ADD_RULE_QUIET, false)) {
 			goto err_close_ruleset;
 		}
 	}
