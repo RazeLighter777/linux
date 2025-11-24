@@ -84,12 +84,12 @@ struct collected_rule_flags {
 	 */
 	layer_mask_t no_inherit_desc_masks;
 	/**
-	 * @blocked_flag_layers: Layers where flag inheritance must be blocked
+	 * @blocked_flag_masks: Layers where flag inheritance must be blocked
 	 * because of a no_inherit rule. This is not a flag itself, but a marker
 	 * for layers that have their flags blocked due to no_inherit rule
 	 * propagation.
 	 */
-	layer_mask_t blocked_flag_layers;
+	layer_mask_t blocked_flag_masks;
 };
 
 /**

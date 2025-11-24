@@ -488,7 +488,7 @@ static bool mask_no_inherit_descendant_layers(
 		if (shared_layers) {
 			rule_flags->no_inherit_masks |= shared_layers;
 			rule_flags->no_inherit_desc_masks |= shared_layers;
-			rule_flags->blocked_flag_layers |= shared_layers;
+			rule_flags->blocked_flag_masks |= shared_layers;
 		}
 	}
 	descendant_layers &= ~child_layers;
@@ -496,7 +496,7 @@ static bool mask_no_inherit_descendant_layers(
 	if (!descendant_layers)
 		return false;
 
-	rule_flags->blocked_flag_layers |= descendant_layers;
+	rule_flags->blocked_flag_masks |= descendant_layers;
 
 	for_each_set_bit(access_bit, &access_req,
 		       ARRAY_SIZE(*layer_masks)) {

@@ -589,7 +589,7 @@ void landlock_log_denial(const struct landlock_cred_security *const subject,
 				request->layer_masks_size);
 			object_quiet_flag = !!(request->rule_flags.quiet_masks &
 				       BIT(youngest_layer)) &&
-				!(request->rule_flags.blocked_flag_layers &
+				!(request->rule_flags.blocked_flag_masks &
 				  BIT(youngest_layer));
 		} else {
 			youngest_layer = get_layer_from_deny_masks(
