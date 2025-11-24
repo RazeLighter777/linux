@@ -323,6 +323,15 @@ static const struct landlock_rule *find_rule(
 	const struct landlock_ruleset *const domain,
 	const struct dentry *const dentry);
 
+/**
+ * landlock_domain_layers_mask - Build a mask covering all layers of a domain
+ * @domain: The ruleset (domain) to inspect.
+ *
+ * Return a layer mask with a 1 bit for each existing layer of @domain.
+ * If @domain has no layers 0 is returned.  If the number of layers is
+ * greater than or equal to the number of bits in layer_mask_t, all bits
+ * are set.
+ */
 static layer_mask_t landlock_domain_layers_mask(
 	const struct landlock_ruleset *const domain)
 {
@@ -335,6 +344,16 @@ static layer_mask_t landlock_domain_layers_mask(
 	return GENMASK_ULL(domain->num_layers - 1, 0);
 }
 
+/**
+ * rule_blocks_all_layers_no_inherit - check whether a rule disables inheritance
+ * @domain_layers_mask: Mask describing the domain's active layers.
+ * @rule: Rule to inspect.
+ *
+ * Return true if every layer present in @rule has its no_inherit flag set
+ * and the set of layers covered by the rule equals @domain_layers_mask.
+ * This indicates that the rule prevents inheritance on all layers of the
+ * domain and thus further walking for inheritance checks can stop.
+ */
 static bool rule_blocks_all_layers_no_inherit(
 	const layer_mask_t domain_layers_mask,
 	const struct landlock_rule *const rule)
@@ -361,6 +380,21 @@ static bool rule_blocks_all_layers_no_inherit(
 
 /**
  * landlock_collect_no_inherit_layers - Collects layers with no_inherit flags
+ */
+/**
+ * landlock_collect_no_inherit_layers - collect effective no_inherit layers
+ * @ruleset: Ruleset to consult.
+ * @dentry: Dentry used as a starting point for the upward walk.
+ *
+ * Walk upwards from @dentry and return a layer mask containing the layers
+ * for which either a rule on the visited dentry has the no_inherit flag set
+ * or where an ancestor was previously marked as having a descendant with
+ * a no_inherit rule.  The search prefers the closest matching dentry and
+ * stops once any relevant layer bits are found or the root is reached.
+ *
+ * Returns a layer_mask_t where each set bit corresponds to a layer with an
+ * effective no_inherit influence for @dentry.  Returns 0 if none apply or if
+ * inputs are invalid.
  */
 static layer_mask_t landlock_collect_no_inherit_layers(
 	const struct landlock_ruleset *const ruleset,
@@ -415,6 +449,20 @@ static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 			     struct dentry *dentry,
 			     layer_mask_t descendant_layers);
 
+/**
+ * mask_no_inherit_descendant_layers - apply descendant no_inherit masking
+ * @domain: The ruleset (domain) to consult.
+ * @dentry: The dentry whose descendants are considered.
+ * @child_layers: Layers present on the child that may be subject to masking.
+ * @access_request: Accesses being requested (bitmask).
+ * @layer_masks: Per-access layer masks to be modified in-place.
+ * @rule_flags: Collected flags which will be updated accordingly.
+ *
+ * If descendant dentries have no_inherit, clear that
+ * layer's bit from @layer_masks. Also updates @rule_flags to reflect
+ * which layers were blocked.  Returns true if any of the @layer_masks were
+ * modified, false otherwise.
+ */
 static bool mask_no_inherit_descendant_layers(
 	const struct landlock_ruleset *const domain,
 	struct dentry *const dentry,
@@ -559,9 +607,29 @@ find_rule(const struct landlock_ruleset *const domain,
 	return rule;
 }
 
+/**
+ * ensure_rule_for_dentry - ensure a ruleset contains a rule entry for dentry,
+ * inserting a blank rule if needed.
+ * @ruleset: Ruleset to modify/inspect.  Caller must hold @ruleset->lock.
+ * @dentry: Dentry to ensure a rule exists for.
+ *
+ * If no rule is currently associated with @dentry, insert an empty rule
+ * (with zero access) tied to the backing inode.  Returns a pointer to the
+ * rule associated with @dentry on success, or NULL on error or when @dentry
+ * is negative.
+ * 
+ * This is useful for LANDLOCK_ADD_RULE_NO_INHERIT processing, where a rule
+ * may need to be created for an ancestor dentry that does not yet have one
+ * to properly track no_inherit flags.
+ * 
+ * The flags are set to zero if a rule is newly created, and the caller
+ * is responsible for setting them appropriately.
+ *
+ * The returned rule pointer's lifetime is tied to @ruleset.
+ */
 static const struct landlock_rule *
 ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
-			    struct dentry *const dentry)
+				struct dentry *const dentry)
 {
 	struct landlock_id id = {
 		.type = LANDLOCK_KEY_INODE,
@@ -591,9 +659,20 @@ ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
 }
 
 
+/**
+ * mark_no_inherit_ancestors - mark ancestors as having no_inherit descendants
+ * @ruleset: Ruleset to modify.  Caller must hold @ruleset->lock.
+ * @dentry: Dentry representing the descendant that carries no_inherit bits.
+ * @descendant_layers: Mask of layers from the descendant that should be
+ *                     advertised to ancestors via has_no_inherit_descendant.
+ *
+ * Walks upward from @dentry and ensures that any ancestor rule contains the
+ * has_no_inherit_descendant marker for the specified @descendant_layers so
+ * parent lookups can quickly detect descendant no_inherit influence.
+ */
 static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
-			     struct dentry *dentry,
-			     layer_mask_t descendant_layers)
+				 struct dentry *dentry,
+				 layer_mask_t descendant_layers)
 {
 	struct dentry *cursor;
 	u32 layer_index;
@@ -619,7 +698,7 @@ static void mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 
 		if (!d_is_negative(parent)) {
 			const struct landlock_rule *rule;
-
+			/* Ensures a rule exists for the parent dentry, inserting a blank one if needed */
 			rule = ensure_rule_for_dentry(ruleset, parent);
 			if (rule) {
 				struct landlock_rule *mutable_rule =
@@ -1557,10 +1636,31 @@ cancel_walk:
 	return ret;
 }
 
+/**
+ * collect_topology_sealed_layers - collect layers sealed against topology changes
+ * @domain: Ruleset to consult.
+ * @dentry: Starting dentry for the upward walk.
+ * @override_layers: Optional out parameter filled with layers that are
+ *                   present on ancestors but considered overrides (not
+ *                   sealing the topology for descendants).
+ *
+ * Walk upwards from @dentry and return a mask of layers where either the
+ * visited dentry contains a no_inherit rule or ancestors were previously
+ * marked as having a descendant with no_inherit.  @override_layers, if not
+ * NULL, is filled with layers that would normally be overridden by more
+ * specific descendant rules.
+ *
+ * Returns a layer mask where set bits indicate layers that are "sealed"
+ * (topology changes like rename/rmdir are denied) for the subtree rooted at
+ * @dentry.
+ * 
+ * Useful for LANDLOCK_ADD_RULE_NO_INHERIT parent directory enforcement to ensure
+ * that topology changes do not violate the no_inherit constraints.
+ */
 static layer_mask_t
 collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
-			       struct dentry *dentry,
-			       layer_mask_t *const override_layers)
+				   struct dentry *dentry,
+				   layer_mask_t *const override_layers)
 {
 	struct dentry *cursor, *parent;
 	bool include_descendants = true;
@@ -1611,6 +1711,15 @@ collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
 	dput(cursor);
 	return sealed_layers;
 }
+/**
+ * deny_no_inherit_topology_change - deny topology changes on sealed layers
+ * @subject: Subject performing the operation (contains the domain).
+ * @dentry: Dentry that is the target of the topology modification.
+ *
+ * Checks whether any domain layers are sealed against topology changes at
+ * @dentry (via collect_topology_sealed_layers).  If so, emit an audit record
+ * and return -EACCES.  Otherwise return 0.
+ */
 static int deny_no_inherit_topology_change(
 	const struct landlock_cred_security *subject,
 	struct dentry *dentry)

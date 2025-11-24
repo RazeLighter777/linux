@@ -64,7 +64,7 @@ struct landlock_layer {
 };
 
 /**
- * struct collected_rule_flags - Hold accumulated flags for each layer.
+ * struct collected_rule_flags - Hold accumulated flags and their markers for each layer.
  */
 struct collected_rule_flags {
 	/**
@@ -77,14 +77,17 @@ struct collected_rule_flags {
 	layer_mask_t no_inherit_masks;
 	/**
 	 * @no_inherit_desc_masks: Layers for which the
-	 * has_no_inherit_descendant "flag" is effective.
-	 * This is not a flag of the rule itself, but a marker set on ancestors
-	 * of rules with the no_inherit flag.
+	 * has_no_inherit_descendant tag is effective.
+	 * This is not a flag itself, but a marker set on ancestors
+	 * of rules with the no_inherit flag to deny topology changes
+	 * in the direct parent path.
 	 */
 	layer_mask_t no_inherit_desc_masks;
 	/**
 	 * @blocked_flag_layers: Layers where flag inheritance must be blocked
-	 * because of a no_inherit rule.
+	 * because of a no_inherit rule. This is not a flag itself, but a marker
+	 * for layers that have their flags blocked due to no_inherit rule
+	 * propagation.
 	 */
 	layer_mask_t blocked_flag_layers;
 };

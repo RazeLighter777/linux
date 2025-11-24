@@ -256,6 +256,7 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 				return -EINVAL;
 			if (WARN_ON_ONCE(this->layers[0].level != 0))
 				return -EINVAL;
+			/* Merge the flags into the rules */
 			this->layers[0].access |= (*layers)[0].access;
 			this->layers[0].flags.quiet |= (*layers)[0].flags.quiet;
 			this->layers[0].flags.no_inherit |=
@@ -776,6 +777,10 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 
 #ifdef CONFIG_SECURITY_LANDLOCK_KUNIT_TEST
 
+/**
+ * test_unmask_layers_no_inherit - Test landlock_unmask_layers() with no_inherit
+ * @rule_flags: Pointer to collected_rule_flags structure to track flags.
+ */
 static void test_unmask_layers_no_inherit(struct kunit *const test)
 {
 	struct landlock_rule *rule;
