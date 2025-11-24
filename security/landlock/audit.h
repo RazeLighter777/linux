@@ -70,8 +70,7 @@ landlock_log_drop_domain(const struct landlock_hierarchy *const hierarchy)
 
 static inline void
 landlock_log_denial(const struct landlock_cred_security *const subject,
-		    const struct landlock_request *const request,
-		    const struct collected_rule_flags rule_flags)
+		    const struct landlock_request *const request)
 {
 }
 
