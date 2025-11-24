@@ -435,13 +435,17 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 			    access_mask_t access_rights, const int flags)
 {
 	int err;
+	const bool is_dir = d_is_dir(path->dentry);
 	struct landlock_id id = {
 		.type = LANDLOCK_KEY_INODE,
 	};
 
 	/* Files only get access rights that make sense. */
-	if (!d_is_dir(path->dentry) &&
+	if (!is_dir &&
 	    (access_rights | ACCESS_FILE) != ACCESS_FILE)
+		return -EINVAL;
+	/* Only directories can have no inherit*/
+	if (!is_dir && (flags & LANDLOCK_ADD_RULE_NO_INHERIT))
 		return -EINVAL;
 	if (WARN_ON_ONCE(ruleset->num_layers != 1))
 		return -EINVAL;
@@ -1498,17 +1502,74 @@ cancel_walk:
 	return ret;
 }
 
+static layer_mask_t
+collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
+                              struct dentry *dentry,
+                              layer_mask_t *const override_layers)
+{
+       struct dentry *cursor, *parent;
+       bool include_descendants = true;
+       layer_mask_t sealed_layers = 0;
+
+       if (override_layers)
+               *override_layers = 0;
+
+       if (!domain || !dentry || d_is_negative(dentry))
+               return 0;
+
+       cursor = dget(dentry);
+       while (cursor) {
+               const struct landlock_rule *rule;
+               u32 layer_index;
+
+               rule = find_rule(domain, cursor);
+               if (rule) {
+                       for (layer_index = 0; layer_index < rule->num_layers;
+                            layer_index++) {
+                               const struct landlock_layer *layer =
+                                       &rule->layers[layer_index];
+                               const int level = layer->level ? layer->level :
+                                                                layer_index + 1;
+                               layer_mask_t layer_bit = BIT_ULL(level - 1);
+
+                               if (include_descendants &&
+                                   (layer->flags.no_inherit ||
+                                    layer->flags.has_no_inherit_descendant)) {
+                                       sealed_layers |= layer_bit;
+                               } else if (override_layers) {
+                                       *override_layers |= layer_bit;
+                               }
+                       }
+               }
+
+               if (sealed_layers || IS_ROOT(cursor))
+                       break;
+
+               parent = dget_parent(cursor);
+               dput(cursor);
+               if (!parent)
+                       return sealed_layers;
+
+               cursor = parent;
+               include_descendants = false;
+       }
+       dput(cursor);
+       return sealed_layers;
+}
 static int deny_no_inherit_topology_change(
 	const struct landlock_cred_security *subject,
 	struct dentry *dentry)
 {
 	layer_mask_t sealed_layers;
+	layer_mask_t override_layers;
 	unsigned long layer_index;
 
 	if (!subject || !dentry || d_is_negative(dentry))
 		return 0;
+	sealed_layers = collect_topology_sealed_layers(
+		subject->domain, dentry, &override_layers);
+	sealed_layers &= ~override_layers;
 
-	sealed_layers = landlock_collect_no_inherit_layers(subject->domain, dentry, true);
 	if (!sealed_layers)
 		return 0;
 
