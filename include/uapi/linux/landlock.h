@@ -142,8 +142,6 @@ struct landlock_ruleset_attr {
  *     This flag also blocks the inheritance of "quiet" flags from parent layers.
  *     In the future if other flags with inheritance properties are added, this flag
  *     will also block their inheritance, too, if doing so is safe.
- * 
- * 
  */
 
 /* clang-format off */
