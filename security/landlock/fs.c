@@ -581,7 +581,7 @@ ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
 	if (IS_ERR(id.key.object))
 		return NULL;
 
-	if (landlock_insert_rule(ruleset, id, 0, LANDLOCK_ADD_RULE_QUIET)) {
+	if (landlock_insert_rule(ruleset, id, 0, 0)) {
 		landlock_put_object(id.key.object);
 		return NULL;
 	}
