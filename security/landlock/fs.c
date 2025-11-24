@@ -1204,7 +1204,6 @@ jump_up:
 					memcpy(&_rule_flag_parent2_bkp,
 					       rule_flags_parent2,
 					       sizeof(_rule_flag_parent2_bkp));
-					is_dom_check_bkp = is_dom_check;
 				}
 				is_dom_check_bkp = is_dom_check;
 				child1_layers = landlock_collect_no_inherit_layers(
@@ -1504,57 +1503,57 @@ cancel_walk:
 
 static layer_mask_t
 collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
-                              struct dentry *dentry,
-                              layer_mask_t *const override_layers)
+			       struct dentry *dentry,
+			       layer_mask_t *const override_layers)
 {
-       struct dentry *cursor, *parent;
-       bool include_descendants = true;
-       layer_mask_t sealed_layers = 0;
+	struct dentry *cursor, *parent;
+	bool include_descendants = true;
+	layer_mask_t sealed_layers = 0;
 
-       if (override_layers)
-               *override_layers = 0;
+	if (override_layers)
+		*override_layers = 0;
 
-       if (!domain || !dentry || d_is_negative(dentry))
-               return 0;
+	if (!domain || !dentry || d_is_negative(dentry))
+		return 0;
 
-       cursor = dget(dentry);
-       while (cursor) {
-               const struct landlock_rule *rule;
-               u32 layer_index;
+	cursor = dget(dentry);
+	while (cursor) {
+		const struct landlock_rule *rule;
+		u32 layer_index;
 
-               rule = find_rule(domain, cursor);
-               if (rule) {
-                       for (layer_index = 0; layer_index < rule->num_layers;
-                            layer_index++) {
-                               const struct landlock_layer *layer =
-                                       &rule->layers[layer_index];
-                               const int level = layer->level ? layer->level :
-                                                                layer_index + 1;
-                               layer_mask_t layer_bit = BIT_ULL(level - 1);
+		rule = find_rule(domain, cursor);
+		if (rule) {
+			for (layer_index = 0; layer_index < rule->num_layers;
+			     layer_index++) {
+				const struct landlock_layer *layer =
+					&rule->layers[layer_index];
+				const int level = layer->level ? layer->level :
+								 layer_index + 1;
+				layer_mask_t layer_bit = BIT_ULL(level - 1);
 
-                               if (include_descendants &&
-                                   (layer->flags.no_inherit ||
-                                    layer->flags.has_no_inherit_descendant)) {
-                                       sealed_layers |= layer_bit;
-                               } else if (override_layers) {
-                                       *override_layers |= layer_bit;
-                               }
-                       }
-               }
+				if (include_descendants &&
+				    (layer->flags.no_inherit ||
+				     layer->flags.has_no_inherit_descendant)) {
+					sealed_layers |= layer_bit;
+				} else if (override_layers) {
+					*override_layers |= layer_bit;
+				}
+			}
+		}
 
-               if (sealed_layers || IS_ROOT(cursor))
-                       break;
+		if (sealed_layers || IS_ROOT(cursor))
+			break;
 
-               parent = dget_parent(cursor);
-               dput(cursor);
-               if (!parent)
-                       return sealed_layers;
+		parent = dget_parent(cursor);
+		dput(cursor);
+		if (!parent)
+			return sealed_layers;
 
-               cursor = parent;
-               include_descendants = false;
-       }
-       dput(cursor);
-       return sealed_layers;
+		cursor = parent;
+		include_descendants = false;
+	}
+	dput(cursor);
+	return sealed_layers;
 }
 static int deny_no_inherit_topology_change(
 	const struct landlock_cred_security *subject,
@@ -1670,6 +1669,16 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 	access_request_parent2 =
 		get_mode_access(d_backing_inode(old_dentry)->i_mode);
 	if (removable) {
+		int err;
+
+		err = deny_no_inherit_topology_change(subject, old_dentry);
+		if (err)
+			return err;
+		if (exchange) {
+			err = deny_no_inherit_topology_change(subject, new_dentry);
+			if (err)
+				return err;
+		}
 		access_request_parent1 |= maybe_remove(old_dentry);
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
@@ -2076,6 +2085,16 @@ static int hook_path_unlink(const struct path *const dir,
 static int hook_path_rmdir(const struct path *const dir,
 			   struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
+
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_DIR);
 }
 
