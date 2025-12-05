@@ -237,8 +237,7 @@ optional_access_t landlock_get_quiet_optional_accesses(
 		const u8 layer = (deny_masks >> (access_index * 4)) &
 				 (LANDLOCK_MAX_NUM_LAYERS - 1);
 		const layer_mask_t layer_bit = BIT(layer);
-		const bool is_quiet = !!(rule_flags.quiet_masks & layer_bit) &&
-				  !(rule_flags.blocked_flag_masks & layer_bit);
+		const bool is_quiet = !!(rule_flags.quiet_masks & layer_bit);
 
 		if (is_quiet)
 			quiet_optional_accesses |= BIT(access_index);

@@ -375,245 +375,6 @@ static bool rule_blocks_all_layers_no_inherit(const layer_mask_t domain_layers_m
 }
 
 /**
- * landlock_collect_no_inherit_layers - Collects layers with no_inherit flags
- */
-/**
- * landlock_collect_no_inherit_layers - collect effective no_inherit layers
- * @ruleset: Ruleset to consult.
- * @dentry: Dentry used as a starting point for the upward walk.
- *
- * Walk upwards from @dentry and return a layer mask containing the layers
- * for which either a rule on the visited dentry has the no_inherit flag set
- * or where an ancestor was previously marked as having a descendant with
- * a no_inherit rule.  The search prefers the closest matching dentry and
- * stops once any relevant layer bits are found or the root is reached.
- *
- * Returns a layer_mask_t where each set bit corresponds to a layer with an
- * effective no_inherit influence for @dentry.  Returns 0 if none apply or if
- * inputs are invalid.
- */
-static layer_mask_t landlock_collect_no_inherit_layers(const struct landlock_ruleset
-						       *const ruleset,
-						       struct dentry *const dentry)
-{
-	struct dentry *cursor, *parent;
-	layer_mask_t layers = 0;
-	bool include_descendants = true;
-
-	if (!ruleset || !dentry || d_is_negative(dentry))
-		return 0;
-
-	cursor = dget(dentry);
-	while (true) {
-		const struct landlock_rule *rule;
-		u32 layer_index;
-
-		rule = find_rule(ruleset, cursor);
-		if (rule) {
-			for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
-				const struct landlock_layer *layer = &rule->layers[layer_index];
-
-				if (layer->flags.no_inherit ||
-				    (include_descendants &&
-				     layer->flags.has_no_inherit_descendant))
-					layers |= BIT_ULL((layer->level ?
-						layer->level : layer_index + 1) - 1);
-			}
-		}
-
-		if (layers) {
-			dput(cursor);
-			return layers;
-		}
-
-		if (IS_ROOT(cursor)) {
-			dput(cursor);
-			break;
-		}
-
-		parent = dget_parent(cursor);
-		dput(cursor);
-		if (!parent)
-			break;
-
-		cursor = parent;
-		include_descendants = false;
-	}
-	return 0;
-}
-
-static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
-				     struct dentry *dentry,
-				     layer_mask_t descendant_layers);
-
-/**
- * mask_no_inherit_descendant_layers - apply descendant no_inherit masking
- * @domain: The ruleset (domain) to consult.
- * @dentry: The dentry whose descendants are considered.
- * @child_layers: Layers present on the child that may be subject to masking.
- * @access_request: Accesses being requested (bitmask).
- * @layer_masks: Per-access layer masks to be modified in-place.
- * @rule_flags: Collected flags which will be updated accordingly.
- *
- * If descendant dentries have no_inherit, clear that
- * layer's bit from @layer_masks. Also updates @rule_flags to reflect
- * which layers were blocked.  Returns true if any of the @layer_masks were
- * modified, false otherwise.
- */
-static bool mask_no_inherit_descendant_layers(const struct landlock_ruleset
-					      *const domain,
-					      struct dentry *const dentry,
-					      layer_mask_t child_layers,
-					      const access_mask_t access_request,
-					      layer_mask_t
-					      (*const layer_masks)
-					      [LANDLOCK_NUM_ACCESS_FS],
-					      struct collected_rule_flags
-					      *const rule_flags)
-{
-	layer_mask_t descendant_layers;
-	const unsigned long access_req = access_request;
-	unsigned long access_bit;
-	bool changed = false;
-
-	if (!access_request || !layer_masks || !rule_flags || !dentry)
-		return false;
-	if (d_is_negative(dentry))
-		return false;
-
-	descendant_layers = landlock_collect_no_inherit_layers(domain, dentry);
-	{
-		layer_mask_t shared_layers = descendant_layers & child_layers;
-
-		if (shared_layers) {
-			rule_flags->no_inherit_masks |= shared_layers;
-			rule_flags->no_inherit_desc_masks |= shared_layers;
-			rule_flags->blocked_flag_masks |= shared_layers;
-		}
-	}
-	descendant_layers &= ~child_layers;
-	descendant_layers &= ~rule_flags->no_inherit_masks;
-	if (!descendant_layers)
-		return false;
-
-	rule_flags->blocked_flag_masks |= descendant_layers;
-
-	for_each_set_bit(access_bit, &access_req,
-			 ARRAY_SIZE(*layer_masks)) {
-		layer_mask_t *const layer_mask = &(*layer_masks)[access_bit];
-
-		if (*layer_mask & descendant_layers) {
-			*layer_mask &= ~descendant_layers;
-			changed = true;
-		}
-	}
-
-	if (!changed)
-		return false;
-
-	rule_flags->no_inherit_masks |= descendant_layers;
-	rule_flags->no_inherit_desc_masks |= descendant_layers;
-
-	return true;
-}
-
-/*
- * @path: Should have been checked by get_path_from_fd().
- */
-int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
-			    const struct path *const path,
-			    access_mask_t access_rights, const int flags)
-{
-	int err;
-	const bool is_dir = d_is_dir(path->dentry);
-	struct landlock_id id = {
-		.type = LANDLOCK_KEY_INODE,
-	};
-
-	/* Files only get access rights that make sense. */
-	if (!is_dir &&
-	    (access_rights | ACCESS_FILE) != ACCESS_FILE)
-		return -EINVAL;
-	if (WARN_ON_ONCE(ruleset->num_layers != 1))
-		return -EINVAL;
-
-	/* Transforms relative access rights to absolute ones. */
-	access_rights |= LANDLOCK_MASK_ACCESS_FS &
-			 ~landlock_get_fs_access_mask(ruleset, 0);
-	id.key.object = get_inode_object(d_backing_inode(path->dentry));
-	if (IS_ERR(id.key.object))
-		return PTR_ERR(id.key.object);
-	mutex_lock(&ruleset->lock);
-	err = landlock_insert_rule(ruleset, id, access_rights, flags);
-	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
-		const struct landlock_rule *rule;
-		layer_mask_t descendant_layers = 0;
-		u32 layer_index;
-
-		rule = find_rule(ruleset, path->dentry);
-		if (rule) {
-			for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
-				const struct landlock_layer *layer =
-					&rule->layers[layer_index];
-
-				if (layer->flags.no_inherit ||
-				    layer->flags.has_no_inherit_descendant)
-					descendant_layers |=
-						BIT_ULL((layer->level ?
-							 layer->level : layer_index + 1) - 1);
-			}
-			if (descendant_layers) {
-				err = mark_no_inherit_ancestors(ruleset, path->dentry,
-								descendant_layers);
-				if (err)
-					goto out_unlock;
-			}
-		}
-	}
-	mutex_unlock(&ruleset->lock);
-out:
-	/*
-	 * No need to check for an error because landlock_insert_rule()
-	 * increments the refcount for the new object if needed.
-	 */
-	landlock_put_object(id.key.object);
-	return err;
-
-out_unlock:
-	mutex_unlock(&ruleset->lock);
-	goto out;
-}
-
-/* Access-control management */
-
-/*
- * The lifetime of the returned rule is tied to @domain.
- *
- * Returns NULL if no rule is found or if @dentry is negative.
- */
-static const struct landlock_rule *
-find_rule(const struct landlock_ruleset *const domain,
-	  const struct dentry *const dentry)
-{
-	const struct landlock_rule *rule;
-	const struct inode *inode;
-	struct landlock_id id = {
-		.type = LANDLOCK_KEY_INODE,
-	};
-
-	/* Ignores nonexistent leafs. */
-	if (d_is_negative(dentry))
-		return NULL;
-
-	inode = d_backing_inode(dentry);
-	rcu_read_lock();
-	id.key.object = rcu_dereference(landlock_inode(inode)->object);
-	rule = landlock_find_rule(domain, id);
-	rcu_read_unlock();
-	return rule;
-}
-
-/**
  * ensure_rule_for_dentry - ensure a ruleset contains a rule entry for dentry,
  * inserting a blank rule if needed.
  * @ruleset: Ruleset to modify/inspect.  Caller must hold @ruleset->lock.
@@ -662,13 +423,15 @@ ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
 		return ERR_PTR(err);
 
 	rule = find_rule(ruleset, dentry);
-	return rule ? rule : ERR_PTR(-ENOENT);
+	if (WARN_ON_ONCE(!rule))
+		return ERR_PTR(-ENOENT);
+	return rule;
 }
 
 /**
  * mark_no_inherit_ancestors - mark ancestors as having no_inherit descendants
  * @ruleset: Ruleset to modify.  Caller must hold @ruleset->lock.
- * @dentry: Dentry representing the descendant that carries no_inherit bits.
+ * @path: Path representing the descendant that carries no_inherit bits.
  * @descendant_layers: Mask of layers from the descendant that should be
  *                     advertised to ancestors via has_no_inherit_descendant.
  *
@@ -679,25 +442,31 @@ ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
  * Returns 0 on success or a negative errno if ancestor bookkeeping fails.
  */
 static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
-				     struct dentry *dentry,
+				     struct path *path,
 				     layer_mask_t descendant_layers)
 {
 	struct dentry *cursor;
-	u32 layer_index;
 	int err = 0;
 
-	if (!ruleset || !dentry || !descendant_layers)
+	if (!ruleset || !path || !path->dentry || !path->mnt ||
+	    !descendant_layers)
 		return -EINVAL;
 
 	lockdep_assert_held(&ruleset->lock);
 
-	cursor = dget(dentry);
+	cursor = dget(path->dentry);
 	while (cursor) {
 		struct dentry *parent;
 
 		if (IS_ROOT(cursor)) {
 			dput(cursor);
-			break;
+			dput(path->dentry);
+			path->dentry = dget(path->mnt->mnt_root);
+			if (!follow_up(path)) {
+				cursor = NULL;
+				continue;
+			}
+			cursor = dget(path->dentry);
 		}
 
 		parent = dget_parent(cursor);
@@ -705,40 +474,142 @@ static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 		if (!parent)
 			break;
 
-		if (!d_is_negative(parent)) {
-			const struct landlock_rule *rule;
-			/* Ensures a rule exists for the parent dentry,
-			 * inserting a blank one if needed
+		if (WARN_ON_ONCE(d_is_negative(parent))) {
+			dput(parent);
+			break;
+		}
+
+		const struct landlock_rule *rule;
+		/* Ensures a rule exists for the parent dentry,
+		 * inserting a blank one if needed
+		*/
+		rule = ensure_rule_for_dentry(ruleset, parent);
+		if (IS_ERR(rule)) {
+			err = PTR_ERR(rule);
+			dput(parent);
+			cursor = NULL;
+			break;
+		}
+		if (rule) {
+			
+			struct landlock_rule *mutable_rule =
+				(struct landlock_rule *)rule;
+
+			/*
+			 * Unmerged rulesets should only have one layer.
 			 */
-			rule = ensure_rule_for_dentry(ruleset, parent);
-			if (IS_ERR(rule)) {
-				err = PTR_ERR(rule);
+			if (WARN_ON_ONCE(mutable_rule->num_layers != 1)) {
 				dput(parent);
-				cursor = NULL;
+				err = -EINVAL;
 				break;
 			}
-			if (rule) {
-				struct landlock_rule *mutable_rule =
-					(struct landlock_rule *)rule;
 
-				for (layer_index = 0;
-				     layer_index < mutable_rule->num_layers;
-				     layer_index++) {
-					struct landlock_layer *layer =
-						&mutable_rule->layers[layer_index];
-					layer_mask_t layer_bit =
-						BIT_ULL((layer->level ?
-							layer->level : layer_index + 1) - 1);
-
-					if (descendant_layers & layer_bit)
-						layer->flags.has_no_inherit_descendant = true;
-				}
-			}
+			if (descendant_layers & BIT_ULL(0))
+				mutable_rule->layers[0].flags.has_no_inherit_descendant = true;
 		}
 
 		cursor = parent;
 	}
 	return err;
+}
+
+/*
+ * @path: Should have been checked by get_path_from_fd().
+ */
+int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
+			    const struct path *const path,
+			    access_mask_t access_rights, const int flags)
+{
+	int err;
+	const bool is_dir = d_is_dir(path->dentry);
+	struct landlock_id id = {
+		.type = LANDLOCK_KEY_INODE,
+	};
+
+	/* Files only get access rights that make sense. */
+	if (!is_dir && (access_rights | ACCESS_FILE) != ACCESS_FILE)
+		return -EINVAL;
+	if (WARN_ON_ONCE(ruleset->num_layers != 1))
+		return -EINVAL;
+
+	/* Transforms relative access rights to absolute ones. */
+	access_rights |= LANDLOCK_MASK_ACCESS_FS &
+			 ~landlock_get_fs_access_mask(ruleset, 0);
+	id.key.object = get_inode_object(d_backing_inode(path->dentry));
+	if (IS_ERR(id.key.object))
+		return PTR_ERR(id.key.object);
+	mutex_lock(&ruleset->lock);
+	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
+		const struct landlock_rule *rule;
+		layer_mask_t descendant_layers = 0;
+
+		rule = find_rule(ruleset, path->dentry);
+		/*
+		 * This was already checked at function entry.
+		 */
+		if (WARN_ON_ONCE(!rule || rule->num_layers != 1))
+			goto out_unlock;
+
+		if (rule->layers[0].flags.no_inherit ||
+		    rule->layers[0].flags.has_no_inherit_descendant)
+			descendant_layers = BIT_ULL(0);
+
+		if (descendant_layers) {
+			struct path walk_path = {
+				.mnt = path->mnt,
+				.dentry = path->dentry,
+			};
+
+			path_get(&walk_path);
+			err = mark_no_inherit_ancestors(ruleset, &walk_path,
+							descendant_layers);
+			path_put(&walk_path);
+			if (err)
+				goto out_unlock;
+		}
+	}
+	mutex_unlock(&ruleset->lock);
+out:
+	/*
+	 * No need to check for an error because landlock_insert_rule()
+	 * increments the refcount for the new object if needed.
+	 */
+	landlock_put_object(id.key.object);
+	return err;
+
+out_unlock:
+	mutex_unlock(&ruleset->lock);
+	goto out;
+}
+
+/* Access-control management */
+
+/*
+ * The lifetime of the returned rule is tied to @domain.
+ *
+ * Returns NULL if no rule is found or if @dentry is negative.
+ */
+static const struct landlock_rule *
+find_rule(const struct landlock_ruleset *const domain,
+	  const struct dentry *const dentry)
+{
+	const struct landlock_rule *rule;
+	const struct inode *inode;
+	struct landlock_id id = {
+		.type = LANDLOCK_KEY_INODE,
+	};
+
+	/* Ignores nonexistent leafs. */
+	if (d_is_negative(dentry))
+		return NULL;
+
+	inode = d_backing_inode(dentry);
+	rcu_read_lock();
+	id.key.object = rcu_dereference(landlock_inode(inode)->object);
+	rule = landlock_find_rule(domain, id);
+	rcu_read_unlock();
+	return rule;
 }
 
 /*
@@ -1139,13 +1010,6 @@ static bool is_access_to_paths_allowed(
 	struct collected_rule_flags *rule_flags_parent1 = &log_request_parent1->rule_flags;
 	struct collected_rule_flags *rule_flags_parent2 = &log_request_parent2->rule_flags;
 	struct collected_rule_flags _rule_flag_parent1_bkp, _rule_flag_parent2_bkp;
-	layer_mask_t child1_layers = 0;
-	layer_mask_t child2_layers = 0;
-
-	if (dentry_child1)
-		child1_layers = landlock_collect_no_inherit_layers(domain, dentry_child1);
-	if (dentry_child2)
-		child2_layers = landlock_collect_no_inherit_layers(domain, dentry_child2);
 
 	if (!access_request_parent1 && !access_request_parent2)
 		return true;
@@ -1350,11 +1214,6 @@ jump_up:
 					       sizeof(_rule_flag_parent2_bkp));
 				}
 				is_dom_check_bkp = is_dom_check;
-				child1_layers = landlock_collect_no_inherit_layers(domain,
-										   walker_path
-										   .dentry);
-				if (layer_masks_parent2)
-					child2_layers = child1_layers;
 
 				/* Ignores hidden mount points. */
 				goto jump_up;
@@ -1378,50 +1237,15 @@ jump_up:
 				break;
 			}
 
-		/*
-		 * We reached a disconnected root directory from a bind mount, and
-		 * we need to reset the walk to the current mount root.
-		 */
-		goto reset_to_mount_root;
-	}
-	if (likely(!d_is_negative(walker_path.dentry))) {
-		child1_layers = landlock_collect_no_inherit_layers(domain,
-								   walker_path.dentry);
-		if (layer_masks_parent2)
-			child2_layers = child1_layers;
-	} else {
-		child1_layers = 0;
-		if (layer_masks_parent2)
-			child2_layers = 0;
-	}
-	parent_dentry = dget_parent(walker_path.dentry);
-	dput(walker_path.dentry);
-	walker_path.dentry = parent_dentry;
-	/*
-	 * Apply descendant no-inherit masking now that we've moved to the
-	 * parent. This ensures the parent respects any no-inherit rules from
-	 * the child we just left. Only applies to refer operations (rename/link).
-	 */
-	if (unlikely(layer_masks_parent2)) {
-		if (mask_no_inherit_descendant_layers(domain, walker_path.dentry,
-						      child1_layers,
-						      access_masked_parent1,
-						      layer_masks_parent1,
-						      rule_flags_parent1))
-			allowed_parent1 =
-				allowed_parent1 ||
-				is_layer_masks_allowed(layer_masks_parent1);
-
-		if (rule_flags_parent2 &&
-		    mask_no_inherit_descendant_layers(domain, walker_path.dentry,
-						      child2_layers,
-						      access_masked_parent2,
-						      layer_masks_parent2,
-						      rule_flags_parent2))
-			allowed_parent2 =
-				allowed_parent2 ||
-				is_layer_masks_allowed(layer_masks_parent2);
-	}
+			/*
+			 * We reached a disconnected root directory from a bind mount, and
+			 * we need to reset the walk to the current mount root.
+			 */
+			goto reset_to_mount_root;
+		}
+		parent_dentry = dget_parent(walker_path.dentry);
+		dput(walker_path.dentry);
+		walker_path.dentry = parent_dentry;
 		continue;
 
 reset_to_mount_root:
@@ -1469,10 +1293,6 @@ reset_to_mount_root:
 		dput(walker_path.dentry);
 		walker_path.dentry = walker_path.mnt->mnt_root;
 		dget(walker_path.dentry);
-		child1_layers = landlock_collect_no_inherit_layers(domain,
-								   walker_path.dentry);
-		if (layer_masks_parent2)
-			child2_layers = child1_layers;
 	}
 	path_put(&walker_path);
 
@@ -1703,9 +1523,7 @@ collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
 			     layer_index++) {
 				const struct landlock_layer *layer =
 					&rule->layers[layer_index];
-				const int level = layer->level ? layer->level :
-								 layer_index + 1;
-				layer_mask_t layer_bit = BIT_ULL(level - 1);
+				layer_mask_t layer_bit = BIT_ULL(layer->level - 1);
 
 				if (include_descendants &&
 				    (layer->flags.no_inherit ||
