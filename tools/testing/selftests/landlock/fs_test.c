@@ -6098,6 +6098,279 @@ TEST_F_FORK(layout4_disconnected_leafs, read_rename_exchange)
 }
 
 /*
+ * Test that LANDLOCK_ADD_RULE_NO_INHERIT on a directory accessed via a mount
+ * point protects the parent hierarchy within the mount from topology changes.
+ *
+ * Layout (after bind mount s1d2 -> s2d2):
+ * tmp
+ * ├── s1d1
+ * │   └── s1d2 [source of bind mount]
+ * │       ├── s1d31
+ * │       │   └── s1d41
+ * │       │       ├── f1
+ * │       │       └── f2
+ * │       └── s1d32
+ * │           └── s1d42
+ * │               ├── f3
+ * │               └── f4
+ * └── s2d1
+ *     └── s2d2 [bind mount destination from s1d2]
+ *         ├── s1d31  <- parent of protected dir, should be immovable
+ *         │   └── s1d41  <- protected with NO_INHERIT
+ *         │       ├── f1
+ *         │       └── f2
+ *         └── s1d32
+ *             └── s1d42
+ *                 ├── f3
+ *                 └── f4
+ *
+ * When s1d41 (accessed via the mount at s2d2) is protected with NO_INHERIT,
+ * its parent directories within the mount (s1d31) should be immovable.
+ */
+TEST_F_FORK(layout4_disconnected_leafs, no_inherit_mount_parent_rename)
+{
+	int ruleset_fd, s1d41_bind_fd;
+	struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_fs = ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				     LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				     LANDLOCK_ACCESS_FS_REMOVE_DIR,
+	};
+
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
+
+	/* Allow full access to TMP_DIR. */
+	add_path_beneath(_metadata, ruleset_fd,
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				 LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				 LANDLOCK_ACCESS_FS_REMOVE_DIR,
+			 TMP_DIR, 0);
+
+	/*
+	 * Access s1d41 through the bind mount at s2d2 and protect it with
+	 * NO_INHERIT. This should seal the parent hierarchy through the mount.
+	 */
+	s1d41_bind_fd = open(TMP_DIR "/s2d1/s2d2/s1d31/s1d41",
+			     O_DIRECTORY | O_PATH | O_CLOEXEC);
+	ASSERT_LE(0, s1d41_bind_fd);
+
+	ASSERT_EQ(0, landlock_add_rule(
+			     ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+			     &(struct landlock_path_beneath_attr){
+				     .parent_fd = s1d41_bind_fd,
+				     .allowed_access = ACCESS_RO,
+			     },
+			     LANDLOCK_ADD_RULE_NO_INHERIT));
+	EXPECT_EQ(0, close(s1d41_bind_fd));
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * s1d31 is the parent of s1d41 within the mount. Renaming it should
+	 * be denied because it is part of the protected parent hierarchy.
+	 * Test via the mount path.
+	 */
+	ASSERT_EQ(-1, rename(TMP_DIR "/s2d1/s2d2/s1d31",
+			     TMP_DIR "/s2d1/s2d2/s1d31_renamed"));
+	ASSERT_EQ(EACCES, errno);
+
+	/*
+	 * s1d32 is a sibling directory (not in the protected parent chain),
+	 * so renaming it should be allowed.
+	 */
+	ASSERT_EQ(0, rename(TMP_DIR "/s2d1/s2d2/s1d32",
+			    TMP_DIR "/s2d1/s2d2/s1d32_renamed"));
+	ASSERT_EQ(0, rename(TMP_DIR "/s2d1/s2d2/s1d32_renamed",
+			    TMP_DIR "/s2d1/s2d2/s1d32"));
+
+	/*
+	 * Renaming directories not in the protected parent hierarchy should
+	 * still be allowed.
+	 */
+	ASSERT_EQ(0, rename(TMP_DIR "/s3d1", TMP_DIR "/s3d1_renamed"));
+	ASSERT_EQ(0, rename(TMP_DIR "/s3d1_renamed", TMP_DIR "/s3d1"));
+}
+
+TEST_F_FORK(layout4_disconnected_leafs, no_inherit_mount_parent_rmdir)
+{
+	int ruleset_fd, s1d41_bind_fd;
+	struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_fs = ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				     LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				     LANDLOCK_ACCESS_FS_REMOVE_DIR,
+	};
+
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
+
+	/* Allow full access to TMP_DIR. */
+	add_path_beneath(_metadata, ruleset_fd,
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				 LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				 LANDLOCK_ACCESS_FS_REMOVE_DIR,
+			 TMP_DIR, 0);
+
+	/*
+	 * Access s1d41 through the bind mount at s2d2 and protect it with
+	 * NO_INHERIT. This should seal the parent hierarchy through the mount.
+	 */
+	s1d41_bind_fd = open(TMP_DIR "/s2d1/s2d2/s1d31/s1d41",
+			     O_DIRECTORY | O_PATH | O_CLOEXEC);
+	ASSERT_LE(0, s1d41_bind_fd);
+
+	ASSERT_EQ(0, landlock_add_rule(
+			     ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+			     &(struct landlock_path_beneath_attr){
+				     .parent_fd = s1d41_bind_fd,
+				     .allowed_access = ACCESS_RO,
+			     },
+			     LANDLOCK_ADD_RULE_NO_INHERIT));
+	EXPECT_EQ(0, close(s1d41_bind_fd));
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * s1d31 is the parent of s1d41 within the mount. Removing it should
+	 * be denied because it is part of the protected parent hierarchy.
+	 */
+	ASSERT_EQ(-1, rmdir(TMP_DIR "/s2d1/s2d2/s1d31"));
+	ASSERT_EQ(EACCES, errno);
+
+	/*
+	 * Removing an unrelated directory should still be allowed (if empty).
+	 */
+	ASSERT_EQ(0, rmdir(TMP_DIR "/s3d1"));
+	ASSERT_EQ(0, mkdir(TMP_DIR "/s3d1", 0755));
+}
+
+TEST_F_FORK(layout4_disconnected_leafs, no_inherit_mount_parent_link)
+{
+	int ruleset_fd, s1d41_bind_fd;
+	struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_fs = ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				     LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				     LANDLOCK_ACCESS_FS_REMOVE_DIR |
+				     LANDLOCK_ACCESS_FS_MAKE_REG,
+	};
+
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
+
+	/* Allow full access to TMP_DIR. */
+	add_path_beneath(_metadata, ruleset_fd,
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				 LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				 LANDLOCK_ACCESS_FS_REMOVE_DIR |
+				 LANDLOCK_ACCESS_FS_MAKE_REG,
+			 TMP_DIR, 0);
+
+	/*
+	 * Access s1d41 through the bind mount at s2d2 and protect it with
+	 * NO_INHERIT. This should seal the parent hierarchy through the mount.
+	 */
+	s1d41_bind_fd = open(TMP_DIR "/s2d1/s2d2/s1d31/s1d41",
+			     O_DIRECTORY | O_PATH | O_CLOEXEC);
+	ASSERT_LE(0, s1d41_bind_fd);
+
+	ASSERT_EQ(0, landlock_add_rule(
+			     ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+			     &(struct landlock_path_beneath_attr){
+				     .parent_fd = s1d41_bind_fd,
+				     .allowed_access = ACCESS_RO,
+			     },
+			     LANDLOCK_ADD_RULE_NO_INHERIT));
+	EXPECT_EQ(0, close(s1d41_bind_fd));
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * Creating a hard link within the protected NO_INHERIT directory should
+	 * be denied because NO_INHERIT grants only ACCESS_RO (no MAKE_REG).
+	 */
+	ASSERT_EQ(-1, linkat(AT_FDCWD, TMP_DIR "/s2d1/s2d2/s1d31/s1d41/f1",
+			     AT_FDCWD, TMP_DIR "/s2d1/s2d2/s1d31/s1d41/f1_link", 0));
+	ASSERT_EQ(EACCES, errno);
+
+	/*
+	 * Creating links within directories outside the protected chain
+	 * (using the mount source path to avoid EXDEV) should still be allowed.
+	 */
+	ASSERT_EQ(0, linkat(AT_FDCWD, TMP_DIR "/s1d1/s1d2/s1d32/s1d42/f3",
+			    AT_FDCWD, TMP_DIR "/s1d1/s1d2/s1d32/s1d42/f3_link", 0));
+	ASSERT_EQ(0, unlink(TMP_DIR "/s1d1/s1d2/s1d32/s1d42/f3_link"));
+}
+
+/*
+ * Test that NO_INHERIT protection extends to the mount source hierarchy.
+ * If a directory is protected via a mount path, its parents within the
+ * mount source should also be protected from topology changes.
+ */
+TEST_F_FORK(layout4_disconnected_leafs, no_inherit_source_parent_rename)
+{
+	int ruleset_fd, s1d41_bind_fd;
+	struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_fs = ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				     LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				     LANDLOCK_ACCESS_FS_REMOVE_DIR,
+	};
+
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
+
+	/* Allow full access to TMP_DIR. */
+	add_path_beneath(_metadata, ruleset_fd,
+			 ACCESS_RW | LANDLOCK_ACCESS_FS_REFER |
+				 LANDLOCK_ACCESS_FS_REMOVE_FILE |
+				 LANDLOCK_ACCESS_FS_REMOVE_DIR,
+			 TMP_DIR, 0);
+
+	/*
+	 * Access s1d41 through the bind mount at s2d2 and protect it with
+	 * NO_INHERIT. The source mount path parents should also be protected.
+	 */
+	s1d41_bind_fd = open(TMP_DIR "/s2d1/s2d2/s1d31/s1d41",
+			     O_DIRECTORY | O_PATH | O_CLOEXEC);
+	ASSERT_LE(0, s1d41_bind_fd);
+
+	ASSERT_EQ(0, landlock_add_rule(
+			     ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
+			     &(struct landlock_path_beneath_attr){
+				     .parent_fd = s1d41_bind_fd,
+				     .allowed_access = ACCESS_RO,
+			     },
+			     LANDLOCK_ADD_RULE_NO_INHERIT));
+	EXPECT_EQ(0, close(s1d41_bind_fd));
+
+	enforce_ruleset(_metadata, ruleset_fd);
+	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * The mount source is s1d1/s1d2. The protected directory s1d41 is at
+	 * s1d1/s1d2/s1d31/s1d41. The parent s1d31 within the mount source
+	 * should be protected from topology changes.
+	 */
+	ASSERT_EQ(-1, rename(TMP_DIR "/s1d1/s1d2/s1d31",
+			     TMP_DIR "/s1d1/s1d2/s1d31_renamed"));
+	ASSERT_EQ(EACCES, errno);
+
+	/*
+	 * s1d32 is a sibling, not in the protected parent chain. It should
+	 * be renamable.
+	 */
+	ASSERT_EQ(0, rename(TMP_DIR "/s1d1/s1d2/s1d32",
+			    TMP_DIR "/s1d1/s1d2/s1d32_renamed"));
+	ASSERT_EQ(0, rename(TMP_DIR "/s1d1/s1d2/s1d32_renamed",
+			    TMP_DIR "/s1d1/s1d2/s1d32"));
+}
+
+/*
  * layout5_disconnected_branch before rename:
  *
  * tmp
