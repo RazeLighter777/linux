@@ -457,7 +457,7 @@ static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 	cursor = dget(path->dentry);
 	while (cursor) {
 		struct dentry *parent;
-
+		/* Follow mounts all the way up to the root */
 		if (IS_ROOT(cursor)) {
 			dput(cursor);
 			dput(path->dentry);
@@ -482,7 +482,7 @@ static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 		const struct landlock_rule *rule;
 		/* Ensures a rule exists for the parent dentry,
 		 * inserting a blank one if needed
-		*/
+		 */
 		rule = ensure_rule_for_dentry(ruleset, parent);
 		if (IS_ERR(rule)) {
 			err = PTR_ERR(rule);
@@ -494,7 +494,6 @@ static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
 			
 			struct landlock_rule *mutable_rule =
 				(struct landlock_rule *)rule;
-
 			/*
 			 * Unmerged rulesets should only have one layer.
 			 */
