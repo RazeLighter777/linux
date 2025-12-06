@@ -404,7 +404,7 @@ ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
 	const struct landlock_rule *rule;
 	int err;
 
-	if (!ruleset || !dentry || d_is_negative(dentry))
+	if (WARN_ON_ONCE(!ruleset || !dentry || d_is_negative(dentry)))
 		return NULL;
 
 	lockdep_assert_held(&ruleset->lock);
@@ -1383,7 +1383,7 @@ collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
 	if (override_layers)
 		*override_layers = 0;
 
-	if (!domain || !dentry || d_is_negative(dentry))
+	if (WARN_ON_ONCE(!domain || !dentry || d_is_negative(dentry)))
 		return 0;
 
 	cursor = dget(dentry);
@@ -1441,7 +1441,7 @@ static int deny_no_inherit_topology_change(const struct landlock_cred_security
 	layer_mask_t override_layers;
 	unsigned long layer_index;
 
-	if (!subject || !dentry || d_is_negative(dentry))
+	if (WARN_ON_ONCE(!subject || !dentry || d_is_negative(dentry)))
 		return 0;
 	sealed_layers = collect_topology_sealed_layers(subject->domain,
 						       dentry, &override_layers);
