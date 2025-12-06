@@ -58,10 +58,9 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 
 #define ENV_FS_RO_NAME "LL_FS_RO"
 #define ENV_FS_RW_NAME "LL_FS_RW"
-#define ENV_FS_RO_NO_INHERIT_NAME "LL_FS_RO_NO_INHERIT"
-#define ENV_FS_RW_NO_INHERIT_NAME "LL_FS_RW_NO_INHERIT"
 #define ENV_FS_QUIET_NAME "LL_FS_QUIET"
 #define ENV_FS_QUIET_ACCESS_NAME "LL_FS_QUIET_ACCESS"
+#define ENV_FS_NO_INHERIT_NAME "LL_FS_NO_INHERIT"
 #define ENV_TCP_BIND_NAME "LL_TCP_BIND"
 #define ENV_TCP_CONNECT_NAME "LL_TCP_CONNECT"
 #define ENV_NET_QUIET_NAME "LL_NET_QUIET"
@@ -123,8 +122,7 @@ static int parse_path(char *env_path, const char ***const path_list)
 /* clang-format on */
 
 static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
-			       const __u64 allowed_access, __u32 flags,
-			       bool mandatory)
+			       const __u64 allowed_access, __u32 flags)
 {
 	int num_paths, i, ret = 1;
 	char *env_path_name;
@@ -135,13 +133,9 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 
 	env_path_name = getenv(env_var);
 	if (!env_path_name) {
-		if (mandatory) {
-			/* Prevents from forgetting to set necessary env vars. */
-			fprintf(stderr, "Missing environment variable %s\n",
-				env_var);
-			return 1;
-		}
-		return 0;
+		/* Prevents users to forget a setting. */
+		fprintf(stderr, "Missing environment variable %s\n", env_var);
+		return 1;
 	}
 	env_path_name = strdup(env_path_name);
 	unsetenv(env_var);
@@ -380,8 +374,6 @@ static const char help[] =
 	"Optional settings (when not set, their associated access check "
 	"is always allowed, which is different from an empty string which "
 	"means an empty list):\n"
-	"* " ENV_FS_RO_NO_INHERIT_NAME ": read-only paths without rule inheritance\n"
-	"* " ENV_FS_RW_NO_INHERIT_NAME ": read-write paths without rule inheritance\n"
 	"* " ENV_TCP_BIND_NAME ": ports allowed to bind (server)\n"
 	"* " ENV_TCP_CONNECT_NAME ": ports allowed to connect (client)\n"
 	"* " ENV_SCOPED_NAME ": actions denied on the outside of the landlock domain\n"
@@ -392,6 +384,8 @@ static const char help[] =
 	"but to test audit we can set " ENV_FORCE_LOG_NAME "=1\n"
 	ENV_FS_QUIET_NAME " and " ENV_NET_QUIET_NAME ", both optional, can then be used "
 	"to make access to some denied paths or network ports not trigger audit logging.\n"
+	ENV_FS_NO_INHERIT_NAME " can be used to specify paths where access rights "
+	"and flags on ancestor inodes do not propagate to children (requires ABI >= 8).\n"
 	ENV_FS_QUIET_ACCESS_NAME " and " ENV_NET_QUIET_ACCESS_NAME " can be used to specify "
 	"which accesses should be quieted (defaults to all):\n"
 	"* " ENV_FS_QUIET_ACCESS_NAME ": file system accesses to quiet\n"
@@ -439,6 +433,7 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	};
 
 	bool quiet_supported = true;
+	bool no_inherit_supported = true;
 	int supported_restrict_flags = LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
 	int set_restrict_flags = 0;
 
@@ -526,8 +521,9 @@ int main(const int argc, char *const argv[], char *const *const envp)
 			LANDLOCK_ABI_LAST, abi);
 		__attribute__((fallthrough));
 	case 7:
-		/* Don't add quiet flags for ABI < 8 later on. */
+		/* Don't add quiet/no_inherit flags for ABI < 8 later on. */
 		quiet_supported = false;
+		no_inherit_supported = false;
 
 		__attribute__((fallthrough));
 	case LANDLOCK_ABI_LAST:
@@ -602,26 +598,22 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		return 1;
 	}
 
-	if (populate_ruleset_fs(ENV_FS_RO_NAME, ruleset_fd, access_fs_ro, 0,
-				true))
+	if (populate_ruleset_fs(ENV_FS_RO_NAME, ruleset_fd, access_fs_ro, 0))
 		goto err_close_ruleset;
-	if (populate_ruleset_fs(ENV_FS_RW_NAME, ruleset_fd, access_fs_rw, 0,
-				true))
-		goto err_close_ruleset;
-	/* Optional no-inherit rules mirror the regular read-only/read-write sets. */
-	if (populate_ruleset_fs(ENV_FS_RO_NO_INHERIT_NAME, ruleset_fd,
-				access_fs_ro, LANDLOCK_ADD_RULE_NO_INHERIT,
-				false))
-		goto err_close_ruleset;
-	if (populate_ruleset_fs(ENV_FS_RW_NO_INHERIT_NAME, ruleset_fd,
-				access_fs_rw, LANDLOCK_ADD_RULE_NO_INHERIT,
-				false))
+	if (populate_ruleset_fs(ENV_FS_RW_NAME, ruleset_fd, access_fs_rw, 0))
 		goto err_close_ruleset;
 
 	/* Don't require this env to be present. */
-	if (quiet_supported) {
+	if (quiet_supported && getenv(ENV_FS_QUIET_NAME)) {
 		if (populate_ruleset_fs(ENV_FS_QUIET_NAME, ruleset_fd, 0,
-					LANDLOCK_ADD_RULE_QUIET, false))
+					LANDLOCK_ADD_RULE_QUIET))
+			goto err_close_ruleset;
+	}
+
+	/* Don't require this env to be present. */
+	if (no_inherit_supported && getenv(ENV_FS_NO_INHERIT_NAME)) {
+		if (populate_ruleset_fs(ENV_FS_NO_INHERIT_NAME, ruleset_fd, 0,
+					LANDLOCK_ADD_RULE_NO_INHERIT))
 			goto err_close_ruleset;
 	}
 
