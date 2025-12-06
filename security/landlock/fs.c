@@ -317,6 +317,207 @@ retry:
 	LANDLOCK_ACCESS_FS_IOCTL_DEV)
 /* clang-format on */
 
+static const struct landlock_rule *find_rule(const struct landlock_ruleset *const domain,
+					     const struct dentry *const dentry);
+
+/**
+ * landlock_domain_layers_mask - Build a mask covering all layers of a domain
+ * @domain: The ruleset (domain) to inspect.
+ *
+ * Return a layer mask with a 1 bit for each existing layer of @domain.
+ * If @domain has no layers 0 is returned.  If the number of layers is
+ * greater than or equal to the number of bits in layer_mask_t, all bits
+ * are set.
+ */
+static layer_mask_t landlock_domain_layers_mask(const struct landlock_ruleset
+						*const domain)
+{
+	if (!domain || !domain->num_layers)
+		return 0;
+
+	if (domain->num_layers >= sizeof(layer_mask_t) * BITS_PER_BYTE)
+		return (layer_mask_t)~0ULL;
+
+	return GENMASK_ULL(domain->num_layers - 1, 0);
+}
+
+/**
+ * rule_blocks_all_layers_no_inherit - check whether a rule disables inheritance
+ * @domain_layers_mask: Mask describing the domain's active layers.
+ * @rule: Rule to inspect.
+ *
+ * Return true if every layer present in @rule has its no_inherit flag set
+ * and the set of layers covered by the rule equals @domain_layers_mask.
+ * This indicates that the rule prevents inheritance on all layers of the
+ * domain and thus further walking for inheritance checks can stop.
+ */
+static bool rule_blocks_all_layers_no_inherit(const layer_mask_t domain_layers_mask,
+					      const struct landlock_rule *const rule)
+{
+	layer_mask_t rule_layers = 0;
+	u32 layer_index;
+
+	if (!domain_layers_mask || !rule)
+		return false;
+
+	for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
+		const struct landlock_layer *const layer =
+			&rule->layers[layer_index];
+		const layer_mask_t layer_bit = BIT_ULL(layer->level - 1);
+
+		if (!layer->flags.no_inherit)
+			return false;
+
+		rule_layers |= layer_bit;
+	}
+
+	return rule_layers && rule_layers == domain_layers_mask;
+}
+
+/**
+ * ensure_rule_for_dentry - ensure a ruleset contains a rule entry for dentry,
+ * inserting a blank rule if needed.
+ * @ruleset: Ruleset to modify/inspect.  Caller must hold @ruleset->lock.
+ * @dentry: Dentry to ensure a rule exists for.
+ *
+ * If no rule is currently associated with @dentry, insert an empty rule
+ * (with zero access) tied to the backing inode.  Returns a pointer to the
+ * rule associated with @dentry on success, NULL when @dentry is negative, or
+ * an ERR_PTR()-encoded error if the rule cannot be created.
+ *
+ * This is useful for LANDLOCK_ADD_RULE_NO_INHERIT processing, where a rule
+ * may need to be created for an ancestor dentry that does not yet have one
+ * to properly track no_inherit flags.
+ *
+ * The flags are set to zero if a rule is newly created, and the caller
+ * is responsible for setting them appropriately.
+ *
+ * The returned rule pointer's lifetime is tied to @ruleset.
+ */
+static const struct landlock_rule *
+ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
+		       struct dentry *const dentry)
+{
+	struct landlock_id id = {
+		.type = LANDLOCK_KEY_INODE,
+	};
+	const struct landlock_rule *rule;
+	int err;
+
+	if (WARN_ON_ONCE(!ruleset || !dentry || d_is_negative(dentry)))
+		return NULL;
+
+	lockdep_assert_held(&ruleset->lock);
+
+	rule = find_rule(ruleset, dentry);
+	if (rule)
+		return rule;
+
+	id.key.object = get_inode_object(d_backing_inode(dentry));
+	if (IS_ERR(id.key.object))
+		return ERR_CAST(id.key.object);
+
+	err = landlock_insert_rule(ruleset, id, 0, 0);
+	landlock_put_object(id.key.object);
+	if (err)
+		return ERR_PTR(err);
+
+	rule = find_rule(ruleset, dentry);
+	if (WARN_ON_ONCE(!rule))
+		return ERR_PTR(-ENOENT);
+	return rule;
+}
+
+/**
+ * mark_no_inherit_ancestors - mark ancestors as having no_inherit descendants
+ * @ruleset: Ruleset to modify.  Caller must hold @ruleset->lock.
+ * @path: Path representing the descendant that carries no_inherit bits.
+ * @descendant_layers: Mask of layers from the descendant that should be
+ *                     advertised to ancestors via has_no_inherit_descendant.
+ *
+ * Walks upward from @dentry and ensures that any ancestor rule contains the
+ * has_no_inherit_descendant marker for the specified @descendant_layers so
+ * parent lookups can quickly detect descendant no_inherit influence.
+ *
+ * Returns 0 on success or a negative errno if ancestor bookkeeping fails.
+ */
+static int mark_no_inherit_ancestors(struct landlock_ruleset *ruleset,
+				     const struct path *const path,
+				     layer_mask_t descendant_layers)
+{
+	struct dentry *cursor;
+	struct path walk_path;
+	int err = 0;
+
+	if (WARN_ON_ONCE(!ruleset || !path || !path->dentry || !path->mnt ||
+			 !descendant_layers))
+		return -EINVAL;
+
+	lockdep_assert_held(&ruleset->lock);
+
+	walk_path.mnt = path->mnt;
+	walk_path.dentry = path->dentry;
+	path_get(&walk_path);
+
+	cursor = dget(walk_path.dentry);
+	while (cursor) {
+		struct dentry *parent;
+		const struct landlock_rule *rule;
+
+		/* Follow mounts all the way up to the root. */
+		if (IS_ROOT(cursor)) {
+			dput(cursor);
+			if (!follow_up(&walk_path)) {
+				cursor = NULL;
+				continue;
+			}
+			cursor = dget(walk_path.dentry);
+		}
+
+		parent = dget_parent(cursor);
+		dput(cursor);
+		if (!parent)
+			break;
+
+		if (WARN_ON_ONCE(d_is_negative(parent))) {
+			dput(parent);
+			break;
+		}
+		/*
+		 * Ensures a rule exists for the parent dentry,
+		 * inserting a blank one if needed.
+		 */
+		rule = ensure_rule_for_dentry(ruleset, parent);
+		if (IS_ERR(rule)) {
+			err = PTR_ERR(rule);
+			dput(parent);
+			cursor = NULL;
+			break;
+		}
+		if (rule) {
+			struct landlock_rule *mutable_rule =
+				(struct landlock_rule *)rule;
+			/*
+			 * Unmerged rulesets should only have one layer.
+			 */
+			if (WARN_ON_ONCE(mutable_rule->num_layers != 1)) {
+				dput(parent);
+				err = -EINVAL;
+				cursor = NULL;
+				break;
+			}
+
+			if (descendant_layers & BIT_ULL(0))
+				mutable_rule->layers[0]
+					.flags.has_no_inherit_descendant = true;
+		}
+
+		cursor = parent;
+	}
+	path_put(&walk_path);
+	return err;
+}
+
 /*
  * @path: Should have been checked by get_path_from_fd().
  */
@@ -344,13 +545,40 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
 	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
+		const struct landlock_rule *rule;
+		layer_mask_t descendant_layers = 0;
+
+		rule = find_rule(ruleset, path->dentry);
+		/*
+		 * This was already checked at function entry.
+		 */
+		if (WARN_ON_ONCE(!rule || rule->num_layers != 1))
+			goto out_unlock;
+
+		if (rule->layers[0].flags.no_inherit ||
+		    rule->layers[0].flags.has_no_inherit_descendant)
+			descendant_layers = BIT_ULL(0);
+
+		if (descendant_layers) {
+			err = mark_no_inherit_ancestors(ruleset, path,
+							descendant_layers);
+			if (err)
+				goto out_unlock;
+		}
+	}
 	mutex_unlock(&ruleset->lock);
+out:
 	/*
 	 * No need to check for an error because landlock_insert_rule()
 	 * increments the refcount for the new object if needed.
 	 */
 	landlock_put_object(id.key.object);
 	return err;
+
+out_unlock:
+	mutex_unlock(&ruleset->lock);
+	goto out;
 }
 
 /* Access-control management */
@@ -764,6 +992,8 @@ static bool is_access_to_paths_allowed(
 	struct landlock_request *const log_request_parent2,
 	struct dentry *const dentry_child2)
 {
+	const layer_mask_t domain_layers_mask =
+		landlock_domain_layers_mask(domain);
 	bool allowed_parent1 = false, allowed_parent2 = false, is_dom_check,
 	     child1_is_directory = true, child2_is_directory = true;
 	struct path walker_path;
@@ -905,6 +1135,10 @@ static bool is_access_to_paths_allowed(
 					       layer_masks_parent2,
 					       ARRAY_SIZE(*layer_masks_parent2),
 					       rule_flags_parent2);
+
+		if (rule &&
+		    rule_blocks_all_layers_no_inherit(domain_layers_mask, rule))
+			break;
 
 		/* Stops when a rule from each layer grants access. */
 		if (allowed_parent1 && allowed_parent2)
@@ -1064,7 +1298,9 @@ static bool collect_domain_accesses(
 	layer_mask_t (*const layer_masks_dom)[LANDLOCK_NUM_ACCESS_FS],
 	struct collected_rule_flags *const rule_flags)
 {
-	unsigned long access_dom;
+	access_mask_t access_dom;
+	const layer_mask_t domain_layers_mask =
+		landlock_domain_layers_mask(domain);
 	bool ret = false;
 
 	if (WARN_ON_ONCE(!domain || !mnt_root || !dir || !layer_masks_dom))
@@ -1080,9 +1316,11 @@ static bool collect_domain_accesses(
 	while (true) {
 		struct dentry *parent_dentry;
 
+		const struct landlock_rule *rule = find_rule(domain, dir);
+
 		/* Gets all layers allowing all domain accesses. */
 		if (landlock_unmask_layers(
-			    find_rule(domain, dir), access_dom, layer_masks_dom,
+			    rule, access_dom, layer_masks_dom,
 			    ARRAY_SIZE(*layer_masks_dom), rule_flags)) {
 			/*
 			 * Stops when all handled accesses are allowed by at
@@ -1091,6 +1329,10 @@ static bool collect_domain_accesses(
 			ret = true;
 			break;
 		}
+
+		if (rule &&
+		    rule_blocks_all_layers_no_inherit(domain_layers_mask, rule))
+			break;
 
 		/*
 		 * Stops at the mount point or the filesystem root for a disconnected
@@ -1105,6 +1347,120 @@ static bool collect_domain_accesses(
 	}
 	dput(dir);
 	return ret;
+}
+
+/**
+ * collect_topology_sealed_layers - collect layers sealed against topology changes
+ * @domain: Ruleset to consult.
+ * @dentry: Starting dentry for the upward walk.
+ * @override_layers: Optional out parameter filled with layers that are
+ *                   present on ancestors but considered overrides (not
+ *                   sealing the topology for descendants).
+ *
+ * Walk upwards from @dentry and return a mask of layers where either the
+ * visited dentry contains a no_inherit rule or ancestors were previously
+ * marked as having a descendant with no_inherit.  @override_layers, if not
+ * NULL, is filled with layers that would normally be overridden by more
+ * specific descendant rules.
+ *
+ * Returns a layer mask where set bits indicate layers that are "sealed"
+ * (topology changes like rename/rmdir are denied) for the subtree rooted at
+ * @dentry.
+ *
+ * Useful for LANDLOCK_ADD_RULE_NO_INHERIT parent directory enforcement to ensure
+ * that topology changes do not violate the no_inherit constraints.
+ */
+static layer_mask_t
+collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
+			       struct dentry *dentry,
+			       layer_mask_t *const override_layers)
+{
+	struct dentry *cursor, *parent;
+	bool include_descendants = true;
+	layer_mask_t sealed_layers = 0;
+
+	if (override_layers)
+		*override_layers = 0;
+
+	if (WARN_ON_ONCE(!domain || !dentry || d_is_negative(dentry)))
+		return 0;
+
+	cursor = dget(dentry);
+	while (cursor) {
+		const struct landlock_rule *rule;
+		u32 layer_index;
+
+		rule = find_rule(domain, cursor);
+		if (rule) {
+			for (layer_index = 0; layer_index < rule->num_layers;
+			     layer_index++) {
+				const struct landlock_layer *layer =
+					&rule->layers[layer_index];
+				layer_mask_t layer_bit =
+					BIT_ULL(layer->level - 1);
+
+				if (include_descendants &&
+				    (layer->flags.no_inherit ||
+				     layer->flags.has_no_inherit_descendant)) {
+					sealed_layers |= layer_bit;
+				} else if (override_layers) {
+					*override_layers |= layer_bit;
+				}
+			}
+		}
+
+		if (sealed_layers || IS_ROOT(cursor))
+			break;
+
+		parent = dget_parent(cursor);
+		dput(cursor);
+		if (!parent)
+			return sealed_layers;
+
+		cursor = parent;
+		include_descendants = false;
+	}
+	dput(cursor);
+	return sealed_layers;
+}
+
+/**
+ * deny_no_inherit_topology_change - deny topology changes on sealed layers
+ * @subject: Subject performing the operation (contains the domain).
+ * @dentry: Dentry that is the target of the topology modification.
+ *
+ * Checks whether any domain layers are sealed against topology changes at
+ * @dentry (via collect_topology_sealed_layers).  If so, emit an audit record
+ * and return -EACCES.  Otherwise return 0.
+ */
+static int deny_no_inherit_topology_change(const struct landlock_cred_security
+					   *subject,
+					   struct dentry *dentry)
+{
+	layer_mask_t sealed_layers;
+	layer_mask_t override_layers;
+	unsigned long layer_index;
+
+	if (WARN_ON_ONCE(!subject || !dentry || d_is_negative(dentry)))
+		return 0;
+	sealed_layers = collect_topology_sealed_layers(subject->domain,
+						       dentry, &override_layers);
+	sealed_layers &= ~override_layers;
+
+	if (!sealed_layers)
+		return 0;
+
+	layer_index = __ffs((unsigned long)sealed_layers);
+	landlock_log_denial(subject, &(struct landlock_request) {
+		.type = LANDLOCK_REQUEST_FS_CHANGE_TOPOLOGY,
+		.audit = {
+			.type = LSM_AUDIT_DATA_DENTRY,
+			.u.dentry = dentry,
+		},
+		.layer_plus_one = layer_index + 1,
+	});
+
+	return -EACCES;
 }
 
 /**
@@ -1191,6 +1547,16 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 	access_request_parent2 =
 		get_mode_access(d_backing_inode(old_dentry)->i_mode);
 	if (removable) {
+		int err;
+
+		err = deny_no_inherit_topology_change(subject, old_dentry);
+		if (err)
+			return err;
+		if (exchange) {
+			err = deny_no_inherit_topology_change(subject, new_dentry);
+			if (err)
+				return err;
+		}
 		access_request_parent1 |= maybe_remove(old_dentry);
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
@@ -1583,12 +1949,31 @@ static int hook_path_symlink(const struct path *const dir,
 static int hook_path_unlink(const struct path *const dir,
 			    struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_FILE);
 }
 
 static int hook_path_rmdir(const struct path *const dir,
 			   struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
+
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_DIR);
 }
 
