@@ -1394,20 +1394,21 @@ collect_topology_sealed_layers(const struct landlock_ruleset *const domain,
 		rule = find_rule(domain, cursor);
 		if (rule) {
 			for (layer_index = 0; layer_index < rule->num_layers;
-                 layer_index++) {
-                const struct landlock_layer *layer =
-                    &rule->layers[layer_index];
-                layer_mask_t layer_bit = BIT_ULL(layer->level - 1);
+			     layer_index++) {
+				const struct landlock_layer *layer =
+					&rule->layers[layer_index];
+				layer_mask_t layer_bit =
+					BIT_ULL(layer->level - 1);
 
-                if (include_descendants &&
-                    (layer->flags.no_inherit ||
-                     layer->flags.has_no_inherit_descendant)) {
-                    sealed_layers |= layer_bit;
-                } else if (override_layers) {
-                    *override_layers |= layer_bit;
-                }
-            }
-        }
+				if (include_descendants &&
+				    (layer->flags.no_inherit ||
+				     layer->flags.has_no_inherit_descendant)) {
+					sealed_layers |= layer_bit;
+				} else if (override_layers) {
+					*override_layers |= layer_bit;
+				}
+			}
+		}
 
 		if (sealed_layers || IS_ROOT(cursor))
 			break;
