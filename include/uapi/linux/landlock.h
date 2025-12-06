@@ -148,7 +148,7 @@ struct landlock_ruleset_attr {
  *
  *     This flag also enforces parent-directory restrictions: rename, rmdir,
  *     link, and other operations that would change the directory's immediate
- *     parent subtree are denied up to the mount point.  This prevents
+ *     parent subtree are denied up to the VFS root.  This prevents
  *     sandboxed processes from manipulating the filesystem hierarchy to evade
  *     restrictions (e.g., via sandbox-restart attacks).
  *
