@@ -717,13 +717,8 @@ TEST_F_FORK(layout1, rule_with_unhandled_access)
 }
 
 static void add_path_beneath(struct __test_metadata *const _metadata,
-<<<<<<< HEAD
 			     const int ruleset_fd, const __u64 allowed_access,
 			     const char *const path, __u32 flags)
-=======
-			 const int ruleset_fd, const __u64 allowed_access,
-			 const char *const path, __u32 flags)
->>>>>>> 1ce2e9bf0594 (selftests/landlock: Implement selftests for LANDLOCK_ADD_RULE_NO_INHERIT)
 {
 	struct landlock_path_beneath_attr path_beneath = {
 		.allowed_access = allowed_access,

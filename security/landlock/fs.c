@@ -1005,13 +1005,6 @@ static bool is_access_to_paths_allowed(
 	(*layer_masks_child2)[LANDLOCK_NUM_ACCESS_FS] = NULL;
 	struct collected_rule_flags *rule_flags_parent1 = &log_request_parent1->rule_flags;
 	struct collected_rule_flags *rule_flags_parent2 = &log_request_parent2->rule_flags;
-	layer_mask_t child1_layers = 0;
-	layer_mask_t child2_layers = 0;
-
-	if (dentry_child1)
-		child1_layers = landlock_collect_no_inherit_layers(domain, dentry_child1);
-	if (dentry_child2)
-		child2_layers = landlock_collect_no_inherit_layers(domain, dentry_child2);
 
 	if (!access_request_parent1 && !access_request_parent2)
 		return true;
@@ -1189,48 +1182,8 @@ jump_up:
 			struct dentry *const parent_dentry =
 				dget_parent(walker_path.dentry);
 
-			/*
-			 * Collect no_inherit layers before moving to the parent.
-			 */
-			if (likely(!d_is_negative(walker_path.dentry))) {
-				child1_layers = landlock_collect_no_inherit_layers(domain,
-										   walker_path.dentry);
-				if (layer_masks_parent2)
-					child2_layers = child1_layers;
-			} else {
-				child1_layers = 0;
-				if (layer_masks_parent2)
-					child2_layers = 0;
-			}
-
 			dput(walker_path.dentry);
 			walker_path.dentry = parent_dentry;
-
-			/*
-			 * Apply descendant no-inherit masking now that we've moved to the
-			 * parent. This ensures the parent respects any no-inherit rules from
-			 * the child we just left. Only applies to refer operations (rename/link).
-			 */
-			if (unlikely(layer_masks_parent2)) {
-				if (mask_no_inherit_descendant_layers(domain, walker_path.dentry,
-								      child1_layers,
-								      access_masked_parent1,
-								      layer_masks_parent1,
-								      rule_flags_parent1))
-					allowed_parent1 =
-						allowed_parent1 ||
-						is_layer_masks_allowed(layer_masks_parent1);
-
-				if (rule_flags_parent2 &&
-				    mask_no_inherit_descendant_layers(domain, walker_path.dentry,
-								      child2_layers,
-								      access_masked_parent2,
-								      layer_masks_parent2,
-								      rule_flags_parent2))
-					allowed_parent2 =
-						allowed_parent2 ||
-						is_layer_masks_allowed(layer_masks_parent2);
-			}
 		}
 	}
 	path_put(&walker_path);
