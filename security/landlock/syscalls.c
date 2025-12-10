@@ -17,6 +17,7 @@
 #include <linux/dcache.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/fdtable.h>
 #include <linux/fs.h>
 #include <linux/limits.h>
 #include <linux/mount.h>
@@ -36,6 +37,7 @@
 #include "net.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "supervisor.h"
 
 static bool is_initialized(void)
 {
@@ -92,7 +94,12 @@ static void build_check_abi(void)
 	struct landlock_ruleset_attr ruleset_attr;
 	struct landlock_path_beneath_attr path_beneath_attr;
 	struct landlock_net_port_attr net_port_attr;
+	struct landlock_supervisor_attr supervisor_attr;
+	struct landlock_supervisor_request supervisor_request;
+	struct landlock_supervisor_response supervisor_response;
 	size_t ruleset_size, path_beneath_size, net_port_size;
+	size_t supervisor_attr_size, supervisor_request_size;
+	size_t supervisor_response_size;
 
 	/*
 	 * For each user space ABI structures, first checks that there is no
@@ -117,6 +124,31 @@ static void build_check_abi(void)
 	net_port_size += sizeof(net_port_attr.port);
 	BUILD_BUG_ON(sizeof(net_port_attr) != net_port_size);
 	BUILD_BUG_ON(sizeof(net_port_attr) != 16);
+
+	supervisor_attr_size = sizeof(supervisor_attr.ruleset_attr);
+	supervisor_attr_size += sizeof(supervisor_attr.supervisor_fd);
+	supervisor_attr_size += sizeof(supervisor_attr.flags);
+	BUILD_BUG_ON(sizeof(supervisor_attr) != supervisor_attr_size);
+	BUILD_BUG_ON(sizeof(supervisor_attr) != 56);
+
+	supervisor_request_size = sizeof(supervisor_request.id);
+	supervisor_request_size += sizeof(supervisor_request.pid);
+	supervisor_request_size += sizeof(supervisor_request.tgid);
+	supervisor_request_size += sizeof(supervisor_request.rule_type);
+	supervisor_request_size += sizeof(supervisor_request.flags);
+	supervisor_request_size += sizeof(supervisor_request.access_request);
+	supervisor_request_size += sizeof(supervisor_request.port);
+	supervisor_request_size += sizeof(supervisor_request.reserved);
+	BUILD_BUG_ON(sizeof(supervisor_request) != supervisor_request_size);
+	BUILD_BUG_ON(sizeof(supervisor_request) != 48);
+
+	supervisor_response_size = sizeof(supervisor_response.id);
+	supervisor_response_size += sizeof(supervisor_response.decision);
+	supervisor_response_size += sizeof(supervisor_response.flags);
+	supervisor_response_size += sizeof(supervisor_response.cache_key_types);
+	supervisor_response_size += sizeof(supervisor_response.reserved);
+	BUILD_BUG_ON(sizeof(supervisor_response) != supervisor_response_size);
+	BUILD_BUG_ON(sizeof(supervisor_response) != 32);
 }
 
 /* Ruleset handling */
@@ -202,8 +234,11 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 		const size_t, size, const __u32, flags)
 {
 	struct landlock_ruleset_attr ruleset_attr;
+	struct landlock_supervisor_attr supervisor_attr;
 	struct landlock_ruleset *ruleset;
-	int err, ruleset_fd;
+	struct landlock_supervisor *supervisor = NULL;
+	int err, ruleset_fd, supervisor_fd = -1;
+	bool is_supervised;
 
 	/* Build-time checks. */
 	build_check_abi();
@@ -211,8 +246,21 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 	if (!is_initialized())
 		return -EOPNOTSUPP;
 
-	if (flags) {
+	is_supervised = !!(flags & LANDLOCK_CREATE_RULESET_SUPERVISED);
+
+	/* Check for unknown flags */
+	if (flags & ~(LANDLOCK_CREATE_RULESET_VERSION |
+		      LANDLOCK_CREATE_RULESET_ERRATA |
+		      LANDLOCK_CREATE_RULESET_SUPERVISED))
+		return -EINVAL;
+
+	/* VERSION and ERRATA flags require attr==NULL and size==0 */
+	if (flags & (LANDLOCK_CREATE_RULESET_VERSION |
+		     LANDLOCK_CREATE_RULESET_ERRATA)) {
 		if (attr || size)
+			return -EINVAL;
+		/* Cannot combine VERSION/ERRATA with SUPERVISED */
+		if (is_supervised)
 			return -EINVAL;
 
 		if (flags == LANDLOCK_CREATE_RULESET_VERSION)
@@ -224,13 +272,33 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 		return -EINVAL;
 	}
 
-	/* Copies raw user space buffer. */
-	err = copy_min_struct_from_user(&ruleset_attr, sizeof(ruleset_attr),
-					offsetofend(typeof(ruleset_attr),
-						    handled_access_fs),
-					attr, size);
-	if (err)
-		return err;
+	/*
+	 * For supervised rulesets, we expect a landlock_supervisor_attr
+	 * which contains the ruleset_attr as its first member.
+	 */
+	if (is_supervised) {
+		err = copy_min_struct_from_user(&supervisor_attr,
+						sizeof(supervisor_attr),
+						offsetofend(typeof(supervisor_attr),
+							    flags),
+						attr, size);
+		if (err)
+			return err;
+
+		/* Reserved flags must be zero */
+		if (supervisor_attr.flags)
+			return -EINVAL;
+
+		ruleset_attr = supervisor_attr.ruleset_attr;
+	} else {
+		/* Copies raw user space buffer. */
+		err = copy_min_struct_from_user(&ruleset_attr, sizeof(ruleset_attr),
+						offsetofend(typeof(ruleset_attr),
+							    handled_access_fs),
+						attr, size);
+		if (err)
+			return err;
+	}
 
 	/* Checks content (and 32-bits cast). */
 	if ((ruleset_attr.handled_access_fs | LANDLOCK_MASK_ACCESS_FS) !=
@@ -272,12 +340,68 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 	ruleset->quiet_masks.net = ruleset_attr.quiet_access_net;
 	ruleset->quiet_masks.scope = ruleset_attr.quiet_scoped;
 
+	/* Create supervisor if requested */
+	if (is_supervised) {
+		supervisor = landlock_create_supervisor(ruleset);
+		if (IS_ERR(supervisor)) {
+			err = PTR_ERR(supervisor);
+			goto err_put_ruleset;
+		}
+
+		/* Allocate supervisors array with one entry for this ruleset */
+		ruleset->supervisors = kcalloc(1, sizeof(*ruleset->supervisors),
+					       GFP_KERNEL_ACCOUNT);
+		if (!ruleset->supervisors) {
+			err = -ENOMEM;
+			goto err_put_supervisor;
+		}
+		ruleset->num_supervisors = 1;
+		ruleset->supervisors[0] = supervisor;
+
+		/* Get the supervisor fd */
+		supervisor_fd = landlock_supervisor_get_fd(supervisor);
+		if (supervisor_fd < 0) {
+			err = supervisor_fd;
+			goto err_put_supervisor;
+		}
+	}
+
 	/* Creates anonymous FD referring to the ruleset. */
 	ruleset_fd = anon_inode_getfd("[landlock-ruleset]", &ruleset_fops,
 				      ruleset, O_RDWR | O_CLOEXEC);
-	if (ruleset_fd < 0)
-		landlock_put_ruleset(ruleset);
+	if (ruleset_fd < 0) {
+		err = ruleset_fd;
+		goto err_close_supervisor;
+	}
+
+	/* Copy supervisor_fd back to userspace if supervised */
+	if (is_supervised) {
+		if (put_user(supervisor_fd,
+			     &((struct landlock_supervisor_attr __user *)attr)->supervisor_fd)) {
+			err = -EFAULT;
+			goto err_close_ruleset;
+		}
+	}
+
 	return ruleset_fd;
+
+err_close_ruleset:
+	/* Close the ruleset fd we just created */
+	close_fd(ruleset_fd);
+	return err;
+
+err_close_supervisor:
+	if (supervisor_fd >= 0)
+		close_fd(supervisor_fd);
+err_put_supervisor:
+	if (supervisor)
+		landlock_put_supervisor(supervisor);
+	if (ruleset->supervisors) {
+		ruleset->supervisors[0] = NULL;
+	}
+err_put_ruleset:
+	landlock_put_ruleset(ruleset);
+	return err;
 }
 
 /*
@@ -352,7 +476,7 @@ static int add_rule_path_beneath(struct landlock_ruleset *const ruleset,
 	/*
 	 * Informs about useless rule: empty allowed_access (i.e. deny rules)
 	 * are ignored in path walks.  However, the rule is not useless if it
-	 * is there to hold a quiet or no inherit flag.
+	 * is there to hold a quiet, no inherit, or supervised flag.
 	 */
 	if (!flags && !path_beneath_attr.allowed_access)
 		return -ENOMSG;
@@ -393,7 +517,7 @@ static int add_rule_net_port(struct landlock_ruleset *ruleset,
 	/*
 	 * Informs about useless rule: empty allowed_access (i.e. deny rules)
 	 * are ignored by network actions.  However, the rule is not useless
-	 * if it is there to hold a quiet flag
+	 * if it is there to hold a quiet or supervised flag.
 	 */
 	if (!flags && !net_port_attr.allowed_access)
 		return -ENOMSG;
@@ -407,7 +531,7 @@ static int add_rule_net_port(struct landlock_ruleset *ruleset,
 	if (flags & LANDLOCK_ADD_RULE_QUIET && !ruleset->quiet_masks.net)
 		return -EINVAL;
 
-	/* No inherit is always useless for this scope */
+	/* No inherit is always useless for network rules. */
 	if (flags & LANDLOCK_ADD_RULE_NO_INHERIT)
 		return -EINVAL;
 
@@ -467,7 +591,9 @@ SYSCALL_DEFINE4(landlock_add_rule, const int, ruleset_fd,
 	if (!is_initialized())
 		return -EOPNOTSUPP;
 	/* Checks flag existence */
-	if (flags && flags & ~(LANDLOCK_ADD_RULE_QUIET | LANDLOCK_ADD_RULE_NO_INHERIT))
+	if (flags & ~(LANDLOCK_ADD_RULE_QUIET |
+		      LANDLOCK_ADD_RULE_NO_INHERIT |
+		      LANDLOCK_ADD_RULE_SUPERVISED))
 		return -EINVAL;
 	/* No inherit may only apply on path_beneath rules. */
 	if ((flags & LANDLOCK_ADD_RULE_NO_INHERIT) &&
@@ -478,6 +604,11 @@ SYSCALL_DEFINE4(landlock_add_rule, const int, ruleset_fd,
 	ruleset = get_ruleset_from_fd(ruleset_fd, FMODE_CAN_WRITE);
 	if (IS_ERR(ruleset))
 		return PTR_ERR(ruleset);
+
+	/* SUPERVISED flag requires a supervised ruleset */
+	if ((flags & LANDLOCK_ADD_RULE_SUPERVISED) &&
+	    (!ruleset->supervisors || !ruleset->supervisors[0]))
+		return -EINVAL;
 
 	switch (rule_type) {
 	case LANDLOCK_RULE_PATH_BENEATH:

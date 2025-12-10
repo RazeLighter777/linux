@@ -30,6 +30,7 @@
 #include "limits.h"
 #include "object.h"
 #include "ruleset.h"
+#include "supervisor.h"
 
 static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 {
@@ -263,6 +264,8 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 				(*layers)[0].flags.no_inherit;
 			this->layers[0].flags.has_no_inherit_descendant |=
 				(*layers)[0].flags.has_no_inherit_descendant;
+			this->layers[0].flags.supervised |=
+				(*layers)[0].flags.supervised;
 			return 0;
 		}
 
@@ -324,6 +327,7 @@ int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 			.no_inherit = !!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
 			.has_no_inherit_descendant =
 				!!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+			.supervised = !!(flags & LANDLOCK_ADD_RULE_SUPERVISED),
 		}
 	} };
 
@@ -498,6 +502,7 @@ out_unlock:
 static void free_ruleset(struct landlock_ruleset *const ruleset)
 {
 	struct landlock_rule *freeme, *next;
+	u32 i;
 
 	might_sleep();
 	rbtree_postorder_for_each_entry_safe(freeme, next, &ruleset->root_inode,
@@ -511,6 +516,11 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	landlock_put_hierarchy(ruleset->hierarchy);
+	if (ruleset->supervisors) {
+		for (i = 0; i < ruleset->num_supervisors; i++)
+			landlock_put_supervisor(ruleset->supervisors[i]);
+		kfree(ruleset->supervisors);
+	}
 	kfree(ruleset);
 }
 
@@ -556,6 +566,7 @@ landlock_merge_ruleset(struct landlock_ruleset *const parent,
 {
 	struct landlock_ruleset *new_dom __free(landlock_put_ruleset) = NULL;
 	u32 num_layers;
+	u32 i;
 	int err;
 
 	might_sleep();
@@ -599,6 +610,34 @@ landlock_merge_ruleset(struct landlock_ruleset *const parent,
 #ifdef CONFIG_AUDIT
 	new_dom->hierarchy->quiet_masks = ruleset->quiet_masks;
 #endif /* CONFIG_AUDIT */
+
+	/*
+	 * Build supervisors array from parent + new ruleset.
+	 * Each layer can have its own supervisor (or NULL if not supervised).
+	 */
+	new_dom->supervisors = kcalloc(num_layers,
+				       sizeof(*new_dom->supervisors),
+				       GFP_KERNEL_ACCOUNT);
+	if (!new_dom->supervisors)
+		return ERR_PTR(-ENOMEM);
+	new_dom->num_supervisors = num_layers;
+
+	/* Copy parent's supervisors for layers 0..parent->num_layers-1 */
+	if (parent && parent->supervisors) {
+		for (i = 0; i < parent->num_supervisors && i < num_layers - 1; i++) {
+			if (parent->supervisors[i]) {
+				new_dom->supervisors[i] = parent->supervisors[i];
+				landlock_get_supervisor(new_dom->supervisors[i]);
+			}
+		}
+	}
+
+	/* Add the new ruleset's supervisor (if any) at the last layer */
+	if (ruleset->supervisors && ruleset->num_supervisors > 0 &&
+	    ruleset->supervisors[0]) {
+		new_dom->supervisors[num_layers - 1] = ruleset->supervisors[0];
+		landlock_get_supervisor(ruleset->supervisors[0]);
+	}
 
 	return no_free_ptr(new_dom);
 }
@@ -683,6 +722,8 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 			rule_flags->no_inherit_masks |= layer_bit;
 		if (rule_flags && layer->flags.has_no_inherit_descendant)
 			rule_flags->no_inherit_desc_masks |= layer_bit;
+		if (rule_flags && layer->flags.supervised)
+			rule_flags->supervised_masks |= layer_bit;
 
 		/*
 		 * Records in @layer_masks which layer grants access to each requested

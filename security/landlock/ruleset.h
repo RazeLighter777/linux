@@ -21,6 +21,7 @@
 #include "object.h"
 
 struct landlock_hierarchy;
+struct landlock_supervisor;
 
 /**
  * struct landlock_layer - Access rights for a given layer
@@ -55,6 +56,11 @@ struct landlock_layer {
 		 * a rule with the no_inherit flag.
 		 */
 		bool has_no_inherit_descendant:1;
+		/**
+		 * @supervised: When set, accesses matching this rule require
+		 * a decision from the userspace supervisor process.
+		 */
+		bool supervised:1;
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -83,6 +89,17 @@ struct collected_rule_flags {
 	 * in the direct parent path.
 	 */
 	layer_mask_t no_inherit_desc_masks;
+	/**
+	 * @supervised_masks: Layers for which the supervised flag is effective.
+	 * Accesses matching these layers require a supervisor decision.
+	 */
+	layer_mask_t supervised_masks;
+	/**
+	 * @blocked_flag_masks: Layers where flag inheritance is blocked due
+	 * to no_inherit. This is used to prevent quiet/supervised flags from
+	 * propagating to children.
+	 */
+	layer_mask_t blocked_flag_masks;
 };
 
 /**
@@ -188,6 +205,17 @@ struct landlock_ruleset {
 	 * domain vanishes.  This is needed for the ptrace protection.
 	 */
 	struct landlock_hierarchy *hierarchy;
+	/**
+	 * @supervisors: Array of supervisors for supervised rulesets, one per
+	 * layer that has supervision enabled. Indexed by layer level.
+	 * For domains, each layer can have its own supervisor.
+	 */
+	struct landlock_supervisor **supervisors;
+	/**
+	 * @num_supervisors: Number of entries in @supervisors array.
+	 * This matches @num_layers for domains.
+	 */
+	u32 num_supervisors;
 	union {
 		/**
 		 * @work_free: Enables to free a ruleset within a lockless

@@ -13,14 +13,19 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
+#include <linux/limits.h>
 #include <linux/socket.h>
+#include <poll.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <stdbool.h>
 
@@ -56,6 +61,378 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 }
 #endif
 
+static inline int
+landlock_create_ruleset_supervised(struct landlock_supervisor_attr *const attr,
+				   const size_t size, const __u32 flags)
+{
+	return syscall(__NR_landlock_create_ruleset, attr, size,
+		       flags | LANDLOCK_CREATE_RULESET_SUPERVISED);
+}
+
+/* Access type names for human-readable output */
+static const char *get_fs_access_name(__u64 access)
+{
+	switch (access) {
+	case LANDLOCK_ACCESS_FS_EXECUTE:
+		return "execute";
+	case LANDLOCK_ACCESS_FS_WRITE_FILE:
+		return "write_file";
+	case LANDLOCK_ACCESS_FS_READ_FILE:
+		return "read_file";
+	case LANDLOCK_ACCESS_FS_READ_DIR:
+		return "read_dir";
+	case LANDLOCK_ACCESS_FS_REMOVE_DIR:
+		return "remove_dir";
+	case LANDLOCK_ACCESS_FS_REMOVE_FILE:
+		return "remove_file";
+	case LANDLOCK_ACCESS_FS_MAKE_CHAR:
+		return "make_char";
+	case LANDLOCK_ACCESS_FS_MAKE_DIR:
+		return "make_dir";
+	case LANDLOCK_ACCESS_FS_MAKE_REG:
+		return "make_reg";
+	case LANDLOCK_ACCESS_FS_MAKE_SOCK:
+		return "make_sock";
+	case LANDLOCK_ACCESS_FS_MAKE_FIFO:
+		return "make_fifo";
+	case LANDLOCK_ACCESS_FS_MAKE_BLOCK:
+		return "make_block";
+	case LANDLOCK_ACCESS_FS_MAKE_SYM:
+		return "make_sym";
+	case LANDLOCK_ACCESS_FS_REFER:
+		return "refer";
+	case LANDLOCK_ACCESS_FS_TRUNCATE:
+		return "truncate";
+	case LANDLOCK_ACCESS_FS_IOCTL_DEV:
+		return "ioctl_dev";
+	default:
+		return "unknown";
+	}
+}
+
+static void print_fs_access_mask(__u64 mask)
+{
+	int first = 1;
+	__u64 bit;
+
+	for (bit = 1; bit && bit <= mask; bit <<= 1) {
+		if (mask & bit) {
+			if (!first)
+				fprintf(stderr, "|");
+			fprintf(stderr, "%s", get_fs_access_name(bit));
+			first = 0;
+		}
+	}
+}
+
+static const char *get_net_access_name(__u64 access)
+{
+	switch (access) {
+	case LANDLOCK_ACCESS_NET_BIND_TCP:
+		return "bind_tcp";
+	case LANDLOCK_ACCESS_NET_CONNECT_TCP:
+		return "connect_tcp";
+	default:
+		return "unknown";
+	}
+}
+
+static void print_net_access_mask(__u64 mask)
+{
+	int first = 1;
+	__u64 bit;
+
+	for (bit = 1; bit && bit <= mask; bit <<= 1) {
+		if (mask & bit) {
+			if (!first)
+				fprintf(stderr, "|");
+			fprintf(stderr, "%s", get_net_access_name(bit));
+			first = 0;
+		}
+	}
+}
+
+/*
+ * Get the path string from an O_PATH file descriptor using /proc/self/fd.
+ * Returns the path in the provided buffer, or an error message.
+ */
+static void get_path_from_fd(int fd, char *buf, size_t buf_size)
+{
+	char proc_path[64];
+	ssize_t len;
+
+	if (fd < 0) {
+		snprintf(buf, buf_size, "(no fd)");
+		return;
+	}
+
+	snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+	len = readlink(proc_path, buf, buf_size - 1);
+	if (len < 0) {
+		snprintf(buf, buf_size, "(error: %s)", strerror(errno));
+		return;
+	}
+	buf[len] = '\0';
+}
+
+/*
+ * Supervisor loop: reads access requests from supervisor_fd and prompts
+ * the user for decisions via stdin/stderr.
+ */
+static int run_supervisor(int supervisor_fd, pid_t child_pid)
+{
+	struct landlock_supervisor_request req;
+	struct landlock_supervisor_response resp;
+	struct pollfd pfds[1];
+	int status;
+	char input[16];
+
+	fprintf(stderr, "\n=== Landlock Supervisor Active ===\n");
+	fprintf(stderr, "Child process PID: %d\n", child_pid);
+	fprintf(stderr, "Waiting for access requests...\n\n");
+
+	pfds[0].fd = supervisor_fd;
+	pfds[0].events = POLLIN;
+
+	while (1) {
+		int ret;
+
+		/* Check if child is still alive */
+		ret = waitpid(child_pid, &status, WNOHANG);
+		if (ret > 0) {
+			fprintf(stderr, "\nChild process exited");
+			if (WIFEXITED(status))
+				fprintf(stderr, " with status %d\n",
+					WEXITSTATUS(status));
+			else if (WIFSIGNALED(status))
+				fprintf(stderr, " due to signal %d\n",
+					WTERMSIG(status));
+			else
+				fprintf(stderr, "\n");
+			break;
+		}
+
+		ret = poll(pfds, 1, 500); /* 500ms timeout */
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("poll failed");
+			return 1;
+		}
+
+		if (ret == 0)
+			continue; /* Timeout, check child again */
+
+		if (!(pfds[0].revents & POLLIN)) {
+			if (pfds[0].revents & (POLLERR | POLLHUP)) {
+				fprintf(stderr,
+					"Supervisor fd closed or error\n");
+				break;
+			}
+			continue;
+		}
+
+		/* Read the request */
+		ret = read(supervisor_fd, &req, sizeof(req));
+		if (ret < 0) {
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			perror("Failed to read supervisor request");
+			return 1;
+		}
+		if (ret == 0) {
+			fprintf(stderr, "Supervisor fd EOF\n");
+			break;
+		}
+		if (ret != sizeof(req)) {
+			fprintf(stderr, "Short read: got %d, expected %zu\n",
+				ret, sizeof(req));
+			continue;
+		}
+
+		/* Variables for filesystem requests - used in caching prompts */
+		struct landlock_supervisor_recv_fd recv_fd = {
+			.id = req.id,
+			.fd = -1,
+			.reserved = 0,
+		};
+		char path_buf[PATH_MAX] = "";
+		bool has_fd = false;
+
+		/* Display the request to the user */
+		fprintf(stderr, "\n--- Access Request ---\n");
+		fprintf(stderr, "Request ID: %llu\n",
+			(unsigned long long)req.id);
+		fprintf(stderr, "PID: %u, TGID: %u\n", req.pid, req.tgid);
+
+		if (req.rule_type == LANDLOCK_RULE_PATH_BENEATH) {
+			fprintf(stderr, "Type: Filesystem access\n");
+			fprintf(stderr, "Access: ");
+			print_fs_access_mask(req.access_request);
+			fprintf(stderr, " (0x%llx)\n",
+				(unsigned long long)req.access_request);
+
+			/* Get O_PATH fd for the actual subject if it exists */
+			ret = ioctl(supervisor_fd,
+				    LANDLOCK_IOCTL_SUPERVISOR_RECV_FD,
+				    &recv_fd);
+			if (ret < 0) {
+				fprintf(stderr,
+					"Warning: Failed to get subject fd: %s\n",
+					strerror(errno));
+			} else if (recv_fd.fd >= 0) {
+				get_path_from_fd(recv_fd.fd, path_buf,
+						 sizeof(path_buf));
+				fprintf(stderr, "Subject: %s\n", path_buf);
+				has_fd = true;
+			}
+
+			/* If we didn't get an fd, the subject may not exist yet */
+			if (!has_fd) {
+				fprintf(stderr, "Subject: (unavailable)\n");
+			}
+
+			/* Clean up fd */
+			if (has_fd)
+				close(recv_fd.fd);
+		} else if (req.rule_type == LANDLOCK_RULE_NET_PORT) {
+			fprintf(stderr, "Type: Network access\n");
+			fprintf(stderr, "Access: ");
+			print_net_access_mask(req.access_request);
+			fprintf(stderr, " (0x%llx)\n",
+				(unsigned long long)req.access_request);
+			fprintf(stderr, "Port: %llu\n",
+				(unsigned long long)req.port);
+		} else {
+			fprintf(stderr, "Type: Unknown (%u)\n", req.rule_type);
+			fprintf(stderr, "Access: 0x%llx\n",
+				(unsigned long long)req.access_request);
+		}
+
+		/* Prompt user for decision */
+		fprintf(stderr,
+			"\nAllow this access? [y/n/c(cache allow)/C(cache deny)]: ");
+		fflush(stderr);
+
+		if (fgets(input, sizeof(input), stdin) == NULL) {
+			fprintf(stderr, "EOF on stdin, denying request\n");
+			resp.decision = LANDLOCK_DECISION_DENY;
+			resp.flags = 0;
+			resp.cache_key_types = 0;
+		} else {
+			switch (input[0]) {
+			case 'y':
+			case 'Y':
+				resp.decision = LANDLOCK_DECISION_ALLOW;
+				resp.flags = 0;
+				resp.cache_key_types = 0;
+				fprintf(stderr, "-> Allowing access\n");
+				break;
+			case 'c':
+			case 'C': {
+				/* Ask for cache key type */
+				char cache_input[32];
+				char key_info[512] = "";
+				
+				resp.decision = (input[0] == 'c') ?
+					LANDLOCK_DECISION_ALLOW :
+					LANDLOCK_DECISION_DENY;
+				resp.flags = LANDLOCK_DECISION_FLAG_CACHE;
+				resp.cache_key_types = 0;
+				
+				fprintf(stderr, "Cache by:\n");
+				if (has_fd) {
+					fprintf(stderr, "  [i] Inode (inode of %s)\n", path_buf);
+				} else {
+					fprintf(stderr, "  [i] Inode (default - file doesn't exist yet)\n");
+				}
+				if (has_fd) {
+					fprintf(stderr, "  [p] Path string (path: %s)\n", path_buf);
+				} else {
+					fprintf(stderr, "  [p] Path string\n");
+				}
+				fprintf(stderr, "  [d] Process ID (PID: %u, TGID: %u)\n",
+					req.pid, req.tgid);
+				fprintf(stderr, "  [m] Multiple (e.g., 'ip' for inode+path)\n");
+				fprintf(stderr, "Choice: ");
+				fflush(stderr);
+				
+				if (fgets(cache_input, sizeof(cache_input), stdin) != NULL) {
+					int j;
+					int key_count = 0;
+					for (j = 0; cache_input[j] && cache_input[j] != '\n'; j++) {
+						switch (cache_input[j]) {
+						case 'i':
+							resp.cache_key_types |= LANDLOCK_CACHE_KEY_INODE;
+							if (key_count++ > 0) strcat(key_info, " + ");
+							strcat(key_info, has_fd ? path_buf : "inode");
+							break;
+						case 'p':
+							resp.cache_key_types |= LANDLOCK_CACHE_KEY_PATH;
+							if (key_count++ > 0) strcat(key_info, " + ");
+							strcat(key_info, has_fd ? path_buf : "path");
+							break;
+						case 'd':
+							resp.cache_key_types |= LANDLOCK_CACHE_KEY_PID;
+							if (key_count++ > 0) strcat(key_info, " + ");
+							snprintf(key_info + strlen(key_info), 
+								sizeof(key_info) - strlen(key_info),
+								"PID %u", req.tgid);
+							break;
+						}
+					}
+				}
+				
+				/* Default to inode if nothing specified */
+				if (resp.cache_key_types == 0) {
+					resp.cache_key_types = LANDLOCK_CACHE_KEY_INODE;
+					snprintf(key_info, sizeof(key_info), "%s",
+						has_fd ? path_buf : "inode");
+				}
+				
+				fprintf(stderr, "-> %s access (cached by: %s)\n",
+					(resp.decision == LANDLOCK_DECISION_ALLOW) ?
+						"Allowing" : "Denying",
+					key_info);
+				break;
+			}
+			case 'n':
+			case 'N':
+			default:
+				resp.decision = LANDLOCK_DECISION_DENY;
+				resp.flags = 0;
+				resp.cache_key_types = 0;
+				fprintf(stderr, "-> Denying access\n");
+				break;
+			}
+		}
+
+		resp.id = req.id;
+
+		/* Send response */
+		ret = write(supervisor_fd, &resp, sizeof(resp));
+		if (ret < 0) {
+			perror("Failed to write supervisor response");
+			return 1;
+		}
+		if (ret != sizeof(resp)) {
+			fprintf(stderr, "Short write: wrote %d, expected %zu\n",
+				ret, sizeof(resp));
+			return 1;
+		}
+	}
+
+	/* Wait for child to finish if not already done */
+	if (waitpid(child_pid, &status, 0) < 0 && errno != ECHILD)
+		perror("waitpid");
+
+	close(supervisor_fd);
+
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	return 1;
+}
+
 #define ENV_FS_RO_NAME "LL_FS_RO"
 #define ENV_FS_RW_NAME "LL_FS_RW"
 #define ENV_FS_QUIET_NAME "LL_FS_QUIET"
@@ -68,6 +445,9 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 #define ENV_SCOPED_NAME "LL_SCOPED"
 #define ENV_SCOPED_QUIET_ACCESS_NAME "LL_SCOPED_QUIET_ACCESS"
 #define ENV_FORCE_LOG_NAME "LL_FORCE_LOG"
+#define ENV_SUPERVISED_NAME "LL_SUPERVISED"
+#define ENV_FS_SUPERVISED_NAME "LL_FS_SUPERVISED"
+#define ENV_NET_SUPERVISED_NAME "LL_NET_SUPERVISED"
 #define ENV_DELIMITER ":"
 
 static int str2num(const char *numstr, __u64 *num_dst)
@@ -130,11 +510,27 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 	struct landlock_path_beneath_attr path_beneath = {
 		.parent_fd = -1,
 	};
+	char *supervised_paths = NULL;
+	const char **supervised_list = NULL;
+	int num_supervised = 0;
+
+	/* Check if we should add supervised flag to any paths */
+	if (!(flags & LANDLOCK_ADD_RULE_SUPERVISED)) {
+		supervised_paths = getenv(ENV_FS_SUPERVISED_NAME);
+		if (supervised_paths) {
+			supervised_paths = strdup(supervised_paths);
+			num_supervised = parse_path(supervised_paths, &supervised_list);
+		}
+	}
 
 	env_path_name = getenv(env_var);
 	if (!env_path_name) {
 		/* Prevents users to forget a setting. */
 		fprintf(stderr, "Missing environment variable %s\n", env_var);
+		if (supervised_paths) {
+			free(supervised_paths);
+			free((void *)supervised_list);
+		}
 		return 1;
 	}
 	env_path_name = strdup(env_path_name);
@@ -155,6 +551,18 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 
 	for (i = 0; i < num_paths; i++) {
 		struct stat statbuf;
+		__u32 path_flags = flags;
+		int j;
+
+		/* Check if this path is also in the supervised list */
+		if (num_supervised > 0 && supervised_list) {
+			for (j = 0; j < num_supervised; j++) {
+				if (strcmp(path_list[i], supervised_list[j]) == 0) {
+					path_flags |= LANDLOCK_ADD_RULE_SUPERVISED;
+					break;
+				}
+			}
+		}
 
 		path_beneath.parent_fd = open(path_list[i], O_PATH | O_CLOEXEC);
 		if (path_beneath.parent_fd < 0) {
@@ -172,7 +580,7 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 		if (!S_ISDIR(statbuf.st_mode))
 			path_beneath.allowed_access &= ACCESS_FILE;
 		if (landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-				      &path_beneath, flags)) {
+				      &path_beneath, path_flags)) {
 			fprintf(stderr,
 				"Failed to update the ruleset with \"%s\": %s\n",
 				path_list[i], strerror(errno));
@@ -186,6 +594,10 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 out_free_name:
 	free(path_list);
 	free(env_path_name);
+	if (supervised_paths) {
+		free(supervised_paths);
+		free((void *)supervised_list);
+	}
 	return ret;
 }
 
@@ -380,6 +792,14 @@ static const char help[] =
 	"  - \"a\" to restrict opening abstract unix sockets\n"
 	"  - \"s\" to restrict sending signals\n"
 	"\n"
+	"Supervised mode (requires ABI >= 9):\n"
+	"* " ENV_SUPERVISED_NAME "=1: Enable supervised mode. The sandboxer forks and the\n"
+	"    parent process becomes a supervisor that receives access requests for\n"
+	"    paths/ports marked as supervised. The user is prompted on stdin to\n"
+	"    allow or deny each access request.\n"
+	"* " ENV_FS_SUPERVISED_NAME ": paths to mark as supervised (prompts user on access)\n"
+	"* " ENV_NET_SUPERVISED_NAME ": ports to mark as supervised (prompts user on access)\n"
+	"\n"
 	"A sandboxer should not log denied access requests to avoid spamming logs, "
 	"but to test audit we can set " ENV_FORCE_LOG_NAME "=1\n"
 	ENV_FS_QUIET_NAME " and " ENV_NET_QUIET_NAME ", both optional, can then be used "
@@ -406,6 +826,13 @@ static const char help[] =
 	ENV_SCOPED_NAME "=\"a:s\" "
 	"%1$s bash -i\n"
 	"\n"
+	"Supervised example:\n"
+	ENV_FS_RO_NAME "=\"${PATH}:/lib:/usr:/proc:/etc\" "
+	ENV_FS_RW_NAME "=\"/tmp\" "
+	ENV_SUPERVISED_NAME "=1 "
+	ENV_FS_SUPERVISED_NAME "=\"/home\" "
+	"%1$s bash -i\n"
+	"\n"
 	"This sandboxer can use Landlock features up to ABI version "
 	STR(LANDLOCK_ABI_LAST) ".\n";
 
@@ -416,7 +843,7 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	const char *cmd_path;
 	char *const *cmd_argv;
 	int ruleset_fd, abi;
-	char *env_port_name, *env_force_log;
+	char *env_port_name, *env_force_log, *env_supervised;
 	__u64 access_fs_ro = ACCESS_FS_ROUGHLY_READ,
 	      access_fs_rw = ACCESS_FS_ROUGHLY_READ | ACCESS_FS_ROUGHLY_WRITE;
 
@@ -430,6 +857,11 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		.quiet_access_net = 0,
 		.quiet_scoped = 0,
 	};
+
+	struct landlock_supervisor_attr supervisor_attr;
+	bool supervised_mode = false;
+	bool supervised_supported = true;
+	int supervisor_fd = -1;
 
 	bool quiet_supported = true;
 	bool no_inherit_supported = true;
@@ -520,9 +952,10 @@ int main(const int argc, char *const argv[], char *const *const envp)
 			LANDLOCK_ABI_LAST, abi);
 		__attribute__((fallthrough));
 	case 7:
-		/* Don't add quiet/no_inherit flags for ABI < 8 later on. */
+		/* Don't add quiet/no_inherit/supervised flags for ABI < 8 */
 		quiet_supported = false;
 		no_inherit_supported = false;
+		supervised_supported = false;
 
 		__attribute__((fallthrough));
 	case LANDLOCK_ABI_LAST:
@@ -590,8 +1023,41 @@ int main(const int argc, char *const argv[], char *const *const envp)
 			return 1;
 	}
 
-	ruleset_fd =
-		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	/* Check for supervised mode */
+	env_supervised = getenv(ENV_SUPERVISED_NAME);
+	if (env_supervised && strcmp(env_supervised, "1") == 0) {
+		if (!supervised_supported) {
+			fprintf(stderr,
+				"Supervised mode not supported by current kernel (requires ABI >= 8)\n");
+			return 1;
+		}
+		supervised_mode = true;
+		unsetenv(ENV_SUPERVISED_NAME);
+	}
+
+	if (supervised_mode) {
+		/* Create supervised ruleset */
+		memset(&supervisor_attr, 0, sizeof(supervisor_attr));
+		supervisor_attr.ruleset_attr = ruleset_attr;
+		supervisor_attr.flags = 0;
+
+		ruleset_fd = landlock_create_ruleset_supervised(
+			&supervisor_attr, sizeof(supervisor_attr), 0);
+		if (ruleset_fd < 0) {
+			perror("Failed to create supervised ruleset");
+			return 1;
+		}
+		supervisor_fd = supervisor_attr.supervisor_fd;
+		fprintf(stderr, "Created supervised ruleset (supervisor_fd=%d)\n",
+			supervisor_fd);
+	} else {
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+						     sizeof(ruleset_attr), 0);
+		if (ruleset_fd < 0) {
+			perror("Failed to create a ruleset");
+			return 1;
+		}
+	}
 	if (ruleset_fd < 0) {
 		perror("Failed to create a ruleset");
 		return 1;
@@ -633,6 +1099,94 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		}
 	}
 
+	/* Add supervised rules if in supervised mode */
+	/* Note: Paths that appear in both LL_FS_RW/LL_FS_RO and 
+	 * LL_FS_SUPERVISED have already been added with the supervised flag,
+	 * so we don't need to add them again here. We only process paths
+	 * that are ONLY in LL_FS_SUPERVISED.
+	 */
+	if (supervised_mode && getenv(ENV_FS_SUPERVISED_NAME)) {
+		/* The supervised paths that match RW/RO paths were already
+		 * added above with the supervised flag, so we skip this.
+		 * This would only add standalone supervised paths.
+		 */
+		char *fs_supervised = getenv(ENV_FS_SUPERVISED_NAME);
+		char *fs_rw = getenv(ENV_FS_RW_NAME);
+		char *fs_ro = getenv(ENV_FS_RO_NAME);
+		bool already_added = false;
+		
+		/* Check if supervised path was already added via RW or RO */
+		if (fs_rw && strcmp(fs_supervised, fs_rw) == 0)
+			already_added = true;
+		if (fs_ro && strcmp(fs_supervised, fs_ro) == 0)
+			already_added = true;
+		
+		if (!already_added) {
+			if (populate_ruleset_fs(ENV_FS_SUPERVISED_NAME, ruleset_fd,
+						access_fs_rw,
+						LANDLOCK_ADD_RULE_SUPERVISED))
+				goto err_close_ruleset;
+		}
+	}
+
+	if (supervised_mode && getenv(ENV_NET_SUPERVISED_NAME)) {
+		if (populate_ruleset_net(
+			    ENV_NET_SUPERVISED_NAME, ruleset_fd,
+			    LANDLOCK_ACCESS_NET_BIND_TCP |
+				    LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			    LANDLOCK_ADD_RULE_SUPERVISED)) {
+			goto err_close_ruleset;
+		}
+	}
+
+	cmd_path = argv[1];
+	cmd_argv = argv + 1;
+
+	if (supervised_mode) {
+		/*
+		 * For supervised mode, fork BEFORE restricting so the parent
+		 * (supervisor) remains unsandboxed and can access the supervisor fd.
+		 * Only the child process gets sandboxed.
+		 */
+		pid_t pid = fork();
+
+		if (pid < 0) {
+			perror("Failed to fork");
+			goto err_close_ruleset;
+		}
+
+		if (pid == 0) {
+			/* Child process: apply sandbox and exec */
+			close(supervisor_fd);
+
+			if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
+				perror("Failed to restrict privileges");
+				close(ruleset_fd);
+				_exit(1);
+			}
+			if (landlock_restrict_self(ruleset_fd, set_restrict_flags)) {
+				perror("Failed to enforce ruleset");
+				close(ruleset_fd);
+				_exit(1);
+			}
+			close(ruleset_fd);
+
+			fprintf(stderr, "Child: Executing sandboxed command...\n");
+			execvpe(cmd_path, cmd_argv, envp);
+			fprintf(stderr, "Failed to execute \"%s\": %s\n",
+				cmd_path, strerror(errno));
+			fprintf(stderr,
+				"Hint: access to the binary, the interpreter or "
+				"shared libraries may be denied.\n");
+			_exit(1);
+		}
+
+		/* Parent process: close ruleset fd and run the supervisor */
+		close(ruleset_fd);
+		return run_supervisor(supervisor_fd, pid);
+	}
+
+	/* Non-supervised mode: apply sandbox and exec directly */
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
 		perror("Failed to restrict privileges");
 		goto err_close_ruleset;
@@ -643,8 +1197,6 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	}
 	close(ruleset_fd);
 
-	cmd_path = argv[1];
-	cmd_argv = argv + 1;
 	fprintf(stderr, "Executing the sandboxed command...\n");
 	execvpe(cmd_path, cmd_argv, envp);
 	fprintf(stderr, "Failed to execute \"%s\": %s\n", cmd_path,
@@ -655,5 +1207,7 @@ int main(const int argc, char *const argv[], char *const *const envp)
 
 err_close_ruleset:
 	close(ruleset_fd);
+	if (supervisor_fd >= 0)
+		close(supervisor_fd);
 	return 1;
 }

@@ -49,6 +49,7 @@
 #include "object.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "supervisor.h"
 
 /* Underlying object management */
 
@@ -1210,7 +1211,8 @@ jump_up:
 }
 
 static int current_check_access_path(const struct path *const path,
-				     access_mask_t access_request)
+				     access_mask_t access_request,
+				     struct dentry *const dentry)
 {
 	const struct access_masks masks = {
 		.fs = access_request,
@@ -1219,18 +1221,80 @@ static int current_check_access_path(const struct path *const path,
 		landlock_get_applicable_subject(current_cred(), masks, NULL);
 	layer_mask_t layer_masks[LANDLOCK_NUM_ACCESS_FS] = {};
 	struct landlock_request request = {};
+	int ret;
+	u32 i;
+	char *rel_path = NULL;
 
 	if (!subject)
 		return 0;
+
+	/*
+	 * If we have a dentry and it's not the same as path->dentry,
+	 * compute the relative path from path to dentry.
+	 */
+	if (dentry && dentry != path->dentry) {
+		char *buf, *p;
+		struct path dentry_path = {
+			.mnt = path->mnt,
+			.dentry = dentry,
+		};
+
+		buf = kmalloc(PATH_MAX, GFP_KERNEL);
+		if (buf) {
+			p = d_path(&dentry_path, buf, PATH_MAX);
+			if (!IS_ERR(p)) {
+				/* Extract just the filename */
+				const char *name = dentry->d_name.name;
+				if (name && name[0])
+					rel_path = kstrdup(name, GFP_KERNEL);
+			}
+			kfree(buf);
+		}
+	}
 
 	access_request = landlock_init_layer_masks(subject->domain,
 						   access_request, &layer_masks,
 						   LANDLOCK_KEY_INODE);
 	if (is_access_to_paths_allowed(subject->domain, path, access_request,
 				       &layer_masks, &request, NULL, 0, NULL,
-				       NULL, NULL))
-		return 0;
+				       NULL, NULL)) {
+		/*
+		 * Access allowed. Check if any supervised rules contributed.
+		 * If so, ask ALL supervisors whose layers are involved.
+		 */
+		if (subject->domain->supervisors &&
+		    request.rule_flags.supervised_masks) {
+			for (i = 0; i < subject->domain->num_supervisors; i++) {
+				layer_mask_t layer_bit = BIT_ULL(i);
 
+				/* Only ask supervisor if its layer is supervised */
+				if (!(request.rule_flags.supervised_masks & layer_bit))
+					continue;
+				if (!subject->domain->supervisors[i])
+					continue;
+
+				/* Set up request for supervisor */
+				request.type = LANDLOCK_REQUEST_FS_ACCESS;
+				request.audit.type = LSM_AUDIT_DATA_PATH;
+				request.audit.u.path = *path;
+				request.access = access_request;
+
+				ret = landlock_supervisor_request_decision(
+					subject->domain->supervisors[i],
+					&request,
+					0);
+				if (ret != 0) {
+					/* Supervisor denied */
+					kfree(rel_path);
+					return -EACCES;
+				}
+			}
+		}
+		kfree(rel_path);
+		return 0;
+	}
+
+	kfree(rel_path);
 	landlock_log_denial(subject, &request);
 	return -EACCES;
 }
@@ -1574,8 +1638,40 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		if (is_access_to_paths_allowed(subject->domain, new_dir,
 					       access_request_parent1,
 					       &layer_masks_parent1, &request1,
-					       NULL, 0, NULL, NULL, NULL))
+					       NULL, 0, NULL, NULL, NULL)) {
+			/*
+			 * Access allowed by rules. Check if any supervised rules
+			 * contributed to this decision.
+			 */
+			if (subject->domain->supervisors &&
+			    request1.rule_flags.supervised_masks) {
+				u32 i;
+				int ret;
+
+				for (i = 0; i < subject->domain->num_supervisors; i++) {
+					layer_mask_t layer_bit = BIT_ULL(i);
+
+					if (!(request1.rule_flags.supervised_masks & layer_bit))
+						continue;
+					if (!subject->domain->supervisors[i])
+						continue;
+
+					/* Set up request for supervisor */
+					request1.type = LANDLOCK_REQUEST_FS_ACCESS;
+					request1.audit.type = LSM_AUDIT_DATA_PATH;
+					request1.audit.u.path = *new_dir;
+					request1.access = access_request_parent1;
+
+					ret = landlock_supervisor_request_decision(
+						subject->domain->supervisors[i],
+						&request1,
+						0);
+					if (ret != 0)
+						return -EACCES;
+				}
+			}
 			return 0;
+		}
 
 		landlock_log_denial(subject, &request1);
 		return -EACCES;
@@ -1607,8 +1703,47 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 						&layer_masks_parent2,
 						&request2.rule_flags);
 
-	if (allow_parent1 && allow_parent2)
+	if (allow_parent1 && allow_parent2) {
+		/*
+		 * Access allowed by rules. Check if any supervised rules
+		 * contributed - if so, ask ALL supervisors whose layers are
+		 * involved, passing both source and destination paths.
+		 */
+		layer_mask_t supervised_masks = request1.rule_flags.supervised_masks |
+						request2.rule_flags.supervised_masks;
+
+		if (subject->domain->supervisors && supervised_masks) {
+			struct path old_path = {
+				.mnt = new_dir->mnt,
+				.dentry = old_dentry,
+			};
+			u32 i;
+			int ret;
+
+			for (i = 0; i < subject->domain->num_supervisors; i++) {
+				layer_mask_t layer_bit = BIT_ULL(i);
+
+				if (!(supervised_masks & layer_bit))
+					continue;
+				if (!subject->domain->supervisors[i])
+					continue;
+
+				/* Set up request for supervisor using request1 */
+				request1.type = LANDLOCK_REQUEST_FS_ACCESS;
+				request1.audit.type = LSM_AUDIT_DATA_PATH;
+				request1.audit.u.path = old_path;
+				request1.access = access_request_parent1 | access_request_parent2;
+
+				ret = landlock_supervisor_request_decision(
+					subject->domain->supervisors[i],
+					&request1,
+					0);
+				if (ret != 0)
+					return -EACCES;
+			}
+		}
 		return 0;
+	}
 
 	/*
 	 * To be able to compare source and destination domain access rights,
@@ -1929,21 +2064,21 @@ static int hook_path_rename(const struct path *const old_dir,
 static int hook_path_mkdir(const struct path *const dir,
 			   struct dentry *const dentry, const umode_t mode)
 {
-	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_MAKE_DIR);
+	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_MAKE_DIR, dentry);
 }
 
 static int hook_path_mknod(const struct path *const dir,
 			   struct dentry *const dentry, const umode_t mode,
 			   const unsigned int dev)
 {
-	return current_check_access_path(dir, get_mode_access(mode));
+	return current_check_access_path(dir, get_mode_access(mode), dentry);
 }
 
 static int hook_path_symlink(const struct path *const dir,
 			     struct dentry *const dentry,
 			     const char *const old_name)
 {
-	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_MAKE_SYM);
+	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_MAKE_SYM, dentry);
 }
 
 static int hook_path_unlink(const struct path *const dir,
@@ -1958,7 +2093,7 @@ static int hook_path_unlink(const struct path *const dir,
 		if (err)
 			return err;
 	}
-	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_FILE);
+	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_FILE, dentry);
 }
 
 static int hook_path_rmdir(const struct path *const dir,
@@ -1974,12 +2109,12 @@ static int hook_path_rmdir(const struct path *const dir,
 			return err;
 	}
 
-	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_DIR);
+	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_DIR, dentry);
 }
 
 static int hook_path_truncate(const struct path *const path)
 {
-	return current_check_access_path(path, LANDLOCK_ACCESS_FS_TRUNCATE);
+	return current_check_access_path(path, LANDLOCK_ACCESS_FS_TRUNCATE, NULL);
 }
 
 /* File hooks */
@@ -2090,6 +2225,59 @@ static int hook_file_open(struct file *const file)
 					      full_access_request, &layer_masks,
 					      LANDLOCK_KEY_INODE),
 		    &layer_masks, &request, NULL, 0, NULL, NULL, NULL)) {
+		/* 
+		 * Access allowed by rules. Check if any supervised rules
+		 * contributed to this decision.
+		 */
+		if (subject->domain->supervisors &&
+		    request.rule_flags.supervised_masks) {
+			u32 i;
+			int ret;
+
+			for (i = 0; i < subject->domain->num_supervisors; i++) {
+				layer_mask_t layer_bit = BIT_ULL(i);
+
+				if (!(request.rule_flags.supervised_masks & layer_bit))
+					continue;
+				if (!subject->domain->supervisors[i])
+					continue;
+
+				/* Set up request for supervisor */
+				request.type = LANDLOCK_REQUEST_FS_ACCESS;
+				request.audit.type = LSM_AUDIT_DATA_FILE;
+				request.audit.u.file = file;
+				request.access = full_access_request;
+
+				ret = landlock_supervisor_request_decision(
+					subject->domain->supervisors[i],
+					&request,
+					0);
+				if (ret != 0) {
+					/* Supervisor denied */
+					landlock_log_denial(subject, &(struct landlock_request) {
+						.type = LANDLOCK_REQUEST_FS_ACCESS,
+						.audit = {
+							.type = LSM_AUDIT_DATA_FILE,
+							.u.file = file,
+						},
+						.all_existing_optional_access = _LANDLOCK_ACCESS_FS_OPTIONAL,
+						.access = open_access_request,
+#ifdef CONFIG_AUDIT
+						.deny_masks = landlock_get_deny_masks(
+							_LANDLOCK_ACCESS_FS_OPTIONAL, optional_access,
+							&layer_masks, ARRAY_SIZE(layer_masks)),
+						.quiet_optional_accesses = landlock_get_quiet_optional_accesses(
+							_LANDLOCK_ACCESS_FS_OPTIONAL,
+							landlock_get_deny_masks(
+								_LANDLOCK_ACCESS_FS_OPTIONAL, optional_access,
+								&layer_masks, ARRAY_SIZE(layer_masks)),
+							request.rule_flags),
+#endif /* CONFIG_AUDIT */
+					});
+					return -EACCES;
+				}
+			}
+		}
 		allowed_access = full_access_request;
 	} else {
 		unsigned long access_bit;

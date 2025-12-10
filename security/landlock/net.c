@@ -18,6 +18,7 @@
 #include "limits.h"
 #include "net.h"
 #include "ruleset.h"
+#include "supervisor.h"
 
 int landlock_append_net_rule(struct landlock_ruleset *const ruleset,
 			     const u16 port, access_mask_t access_rights,
@@ -181,8 +182,45 @@ static int current_check_access_socket(struct socket *const sock,
 						   access_request, &layer_masks,
 						   LANDLOCK_KEY_NET_PORT);
 	if (landlock_unmask_layers(rule, access_request, &layer_masks,
-				   ARRAY_SIZE(layer_masks), &rule_flags))
+				   ARRAY_SIZE(layer_masks), &rule_flags)) {
+		/*
+		 * Access allowed. Check if any supervised rules contributed.
+		 * If so, ask ALL supervisors whose layers are involved.
+		 */
+		if (subject->domain->supervisors && rule_flags.supervised_masks) {
+			struct landlock_request request = {
+				.type = LANDLOCK_REQUEST_NET_ACCESS,
+				.audit.type = LSM_AUDIT_DATA_NET,
+				.audit.u.net = &audit_net,
+				.access = access_request,
+				.rule_flags = rule_flags,
+			};
+			u32 i;
+
+			audit_net.family = address->sa_family;
+
+			for (i = 0; i < subject->domain->num_supervisors; i++) {
+				layer_mask_t layer_bit = BIT_ULL(i);
+				int ret;
+
+				/* Only ask supervisor if its layer is supervised */
+				if (!(rule_flags.supervised_masks & layer_bit))
+					continue;
+				if (!subject->domain->supervisors[i])
+					continue;
+
+				ret = landlock_supervisor_request_decision(
+					subject->domain->supervisors[i],
+					&request,
+					ntohs(port));
+				if (ret != 0) {
+					/* Supervisor denied */
+					return -EACCES;
+				}
+			}
+		}
 		return 0;
+	}
 
 	audit_net.family = address->sa_family;
 	landlock_log_denial(subject,

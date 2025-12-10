@@ -94,10 +94,20 @@ struct landlock_ruleset_attr {
  *
  * %LANDLOCK_CREATE_RULESET_ERRATA
  *     Get a bitmask of fixed issues for the current Landlock ABI version.
+ *
+ * %LANDLOCK_CREATE_RULESET_SUPERVISED
+ *     Create a supervised ruleset. When this flag is set, the ruleset requires
+ *     a supervisor process to make access decisions for rules marked with
+ *     %LANDLOCK_ADD_RULE_SUPERVISED. The supervisor file descriptor is returned
+ *     via the @supervisor_fd field of &struct landlock_supervisor_attr, which
+ *     must be provided when this flag is set. Rules with the
+ *     %LANDLOCK_ADD_RULE_SUPERVISED flag will block the calling process until
+ *     the supervisor makes a decision via the supervision file descriptor.
  */
 /* clang-format off */
 #define LANDLOCK_CREATE_RULESET_VERSION			(1U << 0)
 #define LANDLOCK_CREATE_RULESET_ERRATA			(1U << 1)
+#define LANDLOCK_CREATE_RULESET_SUPERVISED		(1U << 2)
 /* clang-format on */
 
 /**
@@ -155,11 +165,30 @@ struct landlock_ruleset_attr {
  *     In addition, this flag blocks the inheritance of rule-layer flags
  *     (such as the quiet flag) from parent directories to the object covered
  *     by this rule.
+ *
+ * %LANDLOCK_ADD_RULE_SUPERVISED
+ *     When set on a rule being added to a supervised ruleset (created with
+ *     %LANDLOCK_CREATE_RULESET_SUPERVISED), accesses matching this rule will
+ *     block until the supervisor process makes a decision via the supervision
+ *     file descriptor.
+ *
+ *     This flag can only be used with rulesets created with the
+ *     %LANDLOCK_CREATE_RULESET_SUPERVISED flag. Adding a supervised rule to
+ *     a non-supervised ruleset will return -EINVAL.
+ *
+ *     When an access matches a supervised rule, a notification is sent to the
+ *     supervisor containing information about the access request. The supervisor
+ *     must respond with a decision (allow or deny) via the supervision fd.
+ *     The blocked process will wait indefinitely for the supervisor's decision.
+ *
+ *     If the supervisor file descriptor is closed or the supervisor process
+ *     dies, all pending supervised accesses are denied.
  */
 
 /* clang-format off */
 #define LANDLOCK_ADD_RULE_QUIET			(1U << 0)
 #define LANDLOCK_ADD_RULE_NO_INHERIT		(1U << 1)
+#define LANDLOCK_ADD_RULE_SUPERVISED		(1U << 2)
 /* clang-format on */
 
 /**
@@ -283,6 +312,179 @@ struct landlock_net_port_attr {
 	 */
 	__u64 port;
 };
+
+/**
+ * struct landlock_supervisor_attr - Supervisor configuration
+ *
+ * Argument of sys_landlock_create_ruleset() when
+ * %LANDLOCK_CREATE_RULESET_SUPERVISED is set. This structure is passed as
+ * the @attr argument to create_ruleset and must be provided when creating
+ * a supervised ruleset.
+ *
+ * On success, @supervisor_fd is set to a file descriptor that the supervisor
+ * process uses to receive access requests and send decisions.
+ */
+struct landlock_supervisor_attr {
+	/**
+	 * @ruleset_attr: The standard ruleset attributes. This must be filled
+	 * in the same way as a regular landlock_ruleset_attr.
+	 */
+	struct landlock_ruleset_attr ruleset_attr;
+	/**
+	 * @supervisor_fd: On successful return, this field contains the file
+	 * descriptor for the supervision interface. The supervisor reads
+	 * &struct landlock_supervisor_request from this fd and writes
+	 * &struct landlock_supervisor_response to make access decisions.
+	 */
+	__s32 supervisor_fd;
+	/**
+	 * @flags: Reserved for future use, must be 0.
+	 */
+	__u32 flags;
+};
+
+/**
+ * struct landlock_supervisor_request - Access request sent to supervisor
+ *
+ * This structure is read from the supervision file descriptor when a
+ * supervised access is attempted by a sandboxed process. The supervisor
+ * must respond with a &struct landlock_supervisor_response with the
+ * matching @id.
+ */
+struct landlock_supervisor_request {
+	/**
+	 * @id: Unique identifier for this request. Must be echoed back in
+	 * the response. This ID is unique within the supervisor fd's lifetime.
+	 */
+	__u64 id;
+	/**
+	 * @pid: Process ID of the task attempting the access.
+	 */
+	__u32 pid;
+	/**
+	 * @tgid: Thread group ID of the task attempting the access.
+	 */
+	__u32 tgid;
+	/**
+	 * @rule_type: Type of rule that triggered this request
+	 * (e.g., %LANDLOCK_RULE_PATH_BENEATH or %LANDLOCK_RULE_NET_PORT).
+	 */
+	__u32 rule_type;
+	/**
+	 * @flags: Reserved for future use.
+	 */
+	__u32 flags;
+	/**
+	 * @access_request: Bitmask of access rights being requested.
+	 */
+	__u64 access_request;
+	/**
+	 * @port: For network requests, this is the port number.
+	 * Unused (0) for filesystem requests.
+	 */
+	__u64 port;
+	/**
+	 * @reserved: Reserved for future use, must be 0.
+	 */
+	__u64 reserved;
+};
+
+/**
+ * struct landlock_supervisor_response - Decision from supervisor
+ *
+ * This structure is written to the supervision file descriptor to respond
+ * to a &struct landlock_supervisor_request.
+ */
+struct landlock_supervisor_response {
+	/**
+	 * @id: Must match the @id from the corresponding request.
+	 */
+	__u64 id;
+	/**
+	 * @decision: The access decision. Use %LANDLOCK_DECISION_DENY (0) to
+	 * deny access, or %LANDLOCK_DECISION_ALLOW (1) to allow it.
+	 */
+	__s32 decision;
+	/**
+	 * @flags: Flags modifying the decision behavior. See
+	 * %LANDLOCK_DECISION_FLAG_CACHE for caching the decision.
+	 */
+	__u32 flags;
+	/**
+	 * @cache_key_types: Bitmask of cache key types to use when caching
+	 * this decision (only relevant if LANDLOCK_DECISION_FLAG_CACHE is set).
+	 * Combine %LANDLOCK_CACHE_KEY_* flags. If 0, defaults to
+	 * LANDLOCK_CACHE_KEY_INODE.
+	 */
+	__u32 cache_key_types;
+	/**
+	 * @reserved: Reserved for future use, must be 0.
+	 */
+	__u32 reserved[3];
+};
+
+/**
+ * DOC: landlock_decision
+ *
+ * Supervisor decision values
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * These values are used in the @decision field of
+ * &struct landlock_supervisor_response.
+ *
+ * - %LANDLOCK_DECISION_DENY: Deny the access request.
+ * - %LANDLOCK_DECISION_ALLOW: Allow the access request.
+ */
+/* clang-format off */
+#define LANDLOCK_DECISION_DENY				0
+#define LANDLOCK_DECISION_ALLOW				1
+/* clang-format on */
+
+/**
+ * DOC: landlock_decision_flags
+ *
+ * Supervisor decision flags
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * These flags modify the behavior of supervisor decisions.
+ *
+ * %LANDLOCK_DECISION_FLAG_CACHE
+ *     Cache this decision for the lifetime of the domain. Future accesses
+ *     to the same object with the same access rights will use the cached
+ *     decision without consulting the supervisor again.
+ */
+/* clang-format off */
+#define LANDLOCK_DECISION_FLAG_CACHE			(1U << 0)
+/* clang-format on */
+
+/**
+ * DOC: landlock_cache_key_flags
+ *
+ * Cache key type flags
+ * ~~~~~~~~~~~~~~~~~~~~
+ *
+ * These flags specify what should be used as the cache key when
+ * LANDLOCK_DECISION_FLAG_CACHE is set. Multiple flags can be combined.
+ * If no flags are set, the default is to cache by inode.
+ *
+ * %LANDLOCK_CACHE_KEY_INODE
+ *     Cache based on the inode of the primary subject.
+ * %LANDLOCK_CACHE_KEY_INODE2
+ *     Cache based on the inode of the secondary subject (for rename/link).
+ * %LANDLOCK_CACHE_KEY_PATH
+ *     Cache based on the relative path of the primary subject.
+ * %LANDLOCK_CACHE_KEY_PATH2
+ *     Cache based on the relative path of the secondary subject.
+ * %LANDLOCK_CACHE_KEY_PID
+ *     Cache based on the process ID of the requesting task.
+ */
+/* clang-format off */
+#define LANDLOCK_CACHE_KEY_INODE			(1U << 0)
+#define LANDLOCK_CACHE_KEY_INODE2			(1U << 1)
+#define LANDLOCK_CACHE_KEY_PATH				(1U << 2)
+#define LANDLOCK_CACHE_KEY_PATH2			(1U << 3)
+#define LANDLOCK_CACHE_KEY_PID				(1U << 4)
+/* clang-format on */
 
 /**
  * DOC: fs_access
@@ -462,5 +664,48 @@ struct landlock_net_port_attr {
 #define LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET		(1ULL << 0)
 #define LANDLOCK_SCOPE_SIGNAL		                (1ULL << 1)
 /* clang-format on*/
+
+/**
+ * DOC: supervisor_ioctl
+ *
+ * Supervisor ioctl commands
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * These ioctl commands are used with the supervisor file descriptor to
+ * retrieve information about filesystem access requests.
+ *
+ * %LANDLOCK_IOCTL_SUPERVISOR_RECV_FD
+ *     Retrieve an O_PATH file descriptor for the subject of a pending
+ *     filesystem request. The fd is for the actual file/directory being
+ *     accessed. Returns -1 in the fd field if the subject doesn't exist
+ *     or for network requests.
+ */
+
+/**
+ * struct landlock_supervisor_recv_fd - Request path fd for a supervisor request
+ *
+ * This structure is used with the %LANDLOCK_IOCTL_SUPERVISOR_RECV_FD ioctl
+ * to retrieve an O_PATH file descriptor for a filesystem access request.
+ */
+struct landlock_supervisor_recv_fd {
+	/**
+	 * @id: The request ID from &struct landlock_supervisor_request.
+	 * This identifies which pending request to get the fd for.
+	 */
+	__u64 id;
+	/**
+	 * @fd: On success, set to the O_PATH file descriptor for the
+	 * subject of the operation. Set to -1 if the subject doesn't
+	 * exist or for network requests.
+	 */
+	__s32 fd;
+	/**
+	 * @reserved: Reserved for future use, must be 0.
+	 */
+	__s32 reserved;
+};
+
+#define LANDLOCK_IOCTL_SUPERVISOR_RECV_FD \
+	_IOWR('L', 0x10, struct landlock_supervisor_recv_fd)
 
 #endif /* _UAPI_LINUX_LANDLOCK_H */
