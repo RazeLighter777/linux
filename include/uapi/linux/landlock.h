@@ -695,15 +695,61 @@ struct landlock_supervisor_recv_fd {
 	__u64 id;
 	/**
 	 * @fd: On success, set to the O_PATH file descriptor for the
-	 * subject of the operation. Set to -1 if the subject doesn't
+	 * primary subject of the operation. Set to -1 if the subject doesn't
 	 * exist or for network requests.
 	 */
 	__s32 fd;
 	/**
-	 * @reserved: Reserved for future use, must be 0.
+	 * @fd2: On success, set to the O_PATH file descriptor for the
+	 * secondary subject (e.g., destination for rename/link). Set to -1
+	 * if there is no second subject or it doesn't exist yet.
 	 */
-	__s32 reserved;
+	__s32 fd2;
+	/**
+	 * @flags: Flags providing additional information about the subjects.
+	 * See %LANDLOCK_RECV_FD_FLAG_* constants.
+	 */
+	__u32 flags;
+	/**
+	 * @name1_len: Length of the filename in @name1 (excluding null terminator).
+	 * Set to 0 if there is no first subject or the name couldn't be retrieved.
+	 */
+	__u32 name1_len;
+	/**
+	 * @name2_len: Length of the filename in @name2 (excluding null terminator).
+	 * Set to 0 if there is no second subject or the name couldn't be retrieved.
+	 */
+	__u32 name2_len;
+	/**
+	 * @reserved: Reserved for future use.
+	 */
+	__u32 reserved;
+	/**
+	 * @name1: Filename (basename only) of the first subject. This is useful
+	 * for make_* operations where the file doesn't exist yet (e.g., touch).
+	 * The supervisor can use this to enforce filename-based policies.
+	 */
+	char name1[256];
+	/**
+	 * @name2: Filename (basename only) of the second subject. This is useful
+	 * for rename/link operations where the destination doesn't exist yet.
+	 * The supervisor can use this to enforce filename-based policies (e.g.,
+	 * preventing creation of .ssh directories).
+	 */
+	char name2[256];
 };
+
+/**
+ * DOC: recv_fd_flags
+ *
+ * Flags returned in &struct landlock_supervisor_recv_fd.flags
+ *
+ * %LANDLOCK_RECV_FD_FLAG_HAS_SUBJECT2
+ *     Indicates the request involves a second subject (e.g., rename/link
+ *     destination). When set and fd2 is -1, it means the second subject
+ *     doesn't exist yet (e.g., creating a new file via rename).
+ */
+#define LANDLOCK_RECV_FD_FLAG_HAS_SUBJECT2	(1U << 0)
 
 #define LANDLOCK_IOCTL_SUPERVISOR_RECV_FD \
 	_IOWR('L', 0x10, struct landlock_supervisor_recv_fd)

@@ -33,6 +33,13 @@ struct landlock_request {
 	enum landlock_request_type type;
 	struct common_audit_data audit;
 
+	/*
+	 * Optional second audit data for two-path operations (rename, link).
+	 * When has_audit2 is true, audit2 contains the destination path.
+	 */
+	struct common_audit_data audit2;
+	bool has_audit2;
+
 	/**
 	 * layer_plus_one: First layer level that denies the request + 1.  The
 	 * extra one is useful to detect uninitialized field.

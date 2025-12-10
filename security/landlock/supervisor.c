@@ -540,10 +540,11 @@ static long supervisor_ioctl_recv_fd(struct landlock_supervisor *supervisor,
 		(struct landlock_supervisor_recv_fd __user *)arg;
 	struct landlock_supervisor_recv_fd recv_fd;
 	struct landlock_pending_req *req;
-	struct path path1 = {};
-	int fd = -1;
+	struct path path1 = {}, path2 = {};
+	int fd = -1, fd2 = -1;
+	u32 flags = 0;
 	bool found = false;
-	bool has_path1 = false;
+	bool has_path1 = false, has_path2 = false;
 
 	if (copy_from_user(&recv_fd, user_arg, sizeof(recv_fd)))
 		return -EFAULT;
@@ -579,6 +580,27 @@ static long supervisor_ioctl_recv_fd(struct landlock_supervisor *supervisor,
 				/* No path available (network, etc.) */
 				break;
 			}
+
+			/* Check for second path (rename/link operations) */
+			if (req->request.has_audit2) {
+				flags |= LANDLOCK_RECV_FD_FLAG_HAS_SUBJECT2;
+				switch (req->request.audit2.type) {
+				case LSM_AUDIT_DATA_PATH:
+					path2 = req->request.audit2.u.path;
+					path_get(&path2);
+					has_path2 = true;
+					break;
+				case LSM_AUDIT_DATA_FILE:
+					if (req->request.audit2.u.file) {
+						path2 = req->request.audit2.u.file->f_path;
+						path_get(&path2);
+						has_path2 = true;
+					}
+					break;
+				default:
+					break;
+				}
+			}
 			break;
 		}
 	}
@@ -588,25 +610,90 @@ static long supervisor_ioctl_recv_fd(struct landlock_supervisor *supervisor,
 		return -ENOENT;
 
 	/*
-	 * Get O_PATH fd outside the lock (this operation can sleep).
+	 * Get O_PATH fds outside the lock (this operation can sleep).
 	 */
 	if (has_path1 && path1.dentry) {
 		fd = get_path_fd(&path1, path1.dentry);
-		if (fd < 0)
-			fd = -1;
+		if (fd < 0) {
+			/*
+			 * File doesn't exist yet (make_* operation).
+			 * Try to get fd to the parent directory instead.
+			 */
+			if (path1.dentry->d_parent) {
+				fd = get_path_fd(&path1, path1.dentry->d_parent);
+			}
+			if (fd < 0)
+				fd = -1;
+		}
 	}
 
-	/* Release path reference */
+	if (has_path2 && path2.dentry) {
+		fd2 = get_path_fd(&path2, path2.dentry);
+		if (fd2 < 0) {
+			/*
+			 * Destination file doesn't exist yet (rename to new name).
+			 * Try to get fd to the parent directory instead so the
+			 * supervisor can see where the file is being moved to.
+			 */
+			if (path2.dentry->d_parent) {
+				fd2 = get_path_fd(&path2, path2.dentry->d_parent);
+			}
+			if (fd2 < 0)
+				fd2 = -1;
+		}
+	}
+
+	/*
+	 * Copy the pre-captured dentry names. These were captured when the
+	 * request was queued to avoid races with dentry name changes.
+	 */
+	memset(recv_fd.name1, 0, sizeof(recv_fd.name1));
+	recv_fd.name1_len = 0;
+	memset(recv_fd.name2, 0, sizeof(recv_fd.name2));
+	recv_fd.name2_len = 0;
+
+	/* Find the request again to get the captured names */
+	spin_lock(&supervisor->lock);
+	list_for_each_entry(req, &supervisor->pending, list) {
+		if (req->id == recv_fd.id) {
+			if (req->name1[0]) {
+				size_t len = strlen(req->name1);
+
+				if (len >= sizeof(recv_fd.name1))
+					len = sizeof(recv_fd.name1) - 1;
+				memcpy(recv_fd.name1, req->name1, len);
+				recv_fd.name1_len = len;
+			}
+			if (req->name2[0]) {
+				size_t len = strlen(req->name2);
+
+				if (len >= sizeof(recv_fd.name2))
+					len = sizeof(recv_fd.name2) - 1;
+				memcpy(recv_fd.name2, req->name2, len);
+				recv_fd.name2_len = len;
+			}
+			break;
+		}
+	}
+	spin_unlock(&supervisor->lock);
+
+	/* Release path references */
 	if (has_path1)
 		path_put(&path1);
+	if (has_path2)
+		path_put(&path2);
 
-	/* Return fd to userspace */
+	/* Return fds to userspace */
 	recv_fd.fd = fd;
+	recv_fd.fd2 = fd2;
+	recv_fd.flags = flags;
 	recv_fd.reserved = 0;
 
 	if (copy_to_user(user_arg, &recv_fd, sizeof(recv_fd))) {
 		if (fd >= 0)
 			close_fd(fd);
+		if (fd2 >= 0)
+			close_fd(fd2);
 		return -EFAULT;
 	}
 
@@ -727,9 +814,31 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 	 * which key types the supervisor specified when caching.
 	 */
 	if (rule_type == LANDLOCK_RULE_PATH_BENEATH) {
+		const struct dentry *dentry2 = NULL;
+
 		/* Populate inode key from dentry or path */
 		if (dentry && dentry->d_inode)
 			lookup_keys.inode_key = (u64)(uintptr_t)dentry->d_inode;
+
+		/* Populate inode2 key from audit2 if available */
+		if (request->has_audit2) {
+			switch (request->audit2.type) {
+			case LSM_AUDIT_DATA_PATH:
+				dentry2 = request->audit2.u.path.dentry;
+				break;
+			case LSM_AUDIT_DATA_FILE:
+				if (request->audit2.u.file)
+					dentry2 = request->audit2.u.file->f_path.dentry;
+				break;
+			case LSM_AUDIT_DATA_DENTRY:
+				dentry2 = request->audit2.u.dentry;
+				break;
+			default:
+				break;
+			}
+			if (dentry2 && dentry2->d_inode)
+				lookup_keys.inode2_key = (u64)(uintptr_t)dentry2->d_inode;
+		}
 
 		/* Populate PID key */
 		lookup_keys.pid_key = (u64)task_tgid_nr(current);
@@ -752,12 +861,21 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 	cached = cache_lookup(supervisor, rule_type, request->access, &lookup_keys);
 
 	/* If no hit, try with path-based keys */
-	if (!cached && rule_type == LANDLOCK_RULE_PATH_BENEATH && path) {
+	if (!cached && rule_type == LANDLOCK_RULE_PATH_BENEATH) {
 		char *path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
 		if (path_buf) {
-			char *full_path = d_path(path, path_buf, PATH_MAX);
-			if (!IS_ERR(full_path))
-				lookup_keys.path_key = full_name_hash(NULL, full_path, strlen(full_path));
+			if (path) {
+				char *full_path = d_path(path, path_buf, PATH_MAX);
+				if (!IS_ERR(full_path))
+					lookup_keys.path_key = full_name_hash(NULL, full_path, strlen(full_path));
+			}
+			/* Also populate path2 if audit2 is available */
+			if (request->has_audit2 &&
+			    request->audit2.type == LSM_AUDIT_DATA_PATH) {
+				char *full_path = d_path(&request->audit2.u.path, path_buf, PATH_MAX);
+				if (!IS_ERR(full_path))
+					lookup_keys.path2_key = full_name_hash(NULL, full_path, strlen(full_path));
+			}
 			kfree(path_buf);
 		}
 		/* Try lookup again with path keys populated */
@@ -780,6 +898,38 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 	req.flags = 0;
 	req.cache_key_types = 0;
 
+	/*
+	 * Capture dentry names now because they can change after we release
+	 * the lock. The dentry name is stable as long as we hold a reference
+	 * to the path/dentry.
+	 */
+	memset(req.name1, 0, sizeof(req.name1));
+	memset(req.name2, 0, sizeof(req.name2));
+	if (dentry && dentry->d_name.name) {
+		strscpy(req.name1, dentry->d_name.name, sizeof(req.name1));
+	}
+	if (request->has_audit2) {
+		const struct dentry *dentry2 = NULL;
+
+		switch (request->audit2.type) {
+		case LSM_AUDIT_DATA_PATH:
+			dentry2 = request->audit2.u.path.dentry;
+			break;
+		case LSM_AUDIT_DATA_FILE:
+			if (request->audit2.u.file)
+				dentry2 = request->audit2.u.file->f_path.dentry;
+			break;
+		case LSM_AUDIT_DATA_DENTRY:
+			dentry2 = request->audit2.u.dentry;
+			break;
+		default:
+			break;
+		}
+		if (dentry2 && dentry2->d_name.name) {
+			strscpy(req.name2, dentry2->d_name.name, sizeof(req.name2));
+		}
+	}
+
 	/* Add to pending list */
 	list_add_tail(&req.list, &supervisor->pending);
 	spin_unlock(&supervisor->lock);
@@ -801,11 +951,34 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 	/* Cache the decision if CACHE flag was set */
 	if (req.flags & LANDLOCK_DECISION_FLAG_CACHE) {
 		struct landlock_cache_keys keys = {};
+		const struct dentry *dentry2 = NULL;
+		const struct path *path2 = NULL;
 		u32 key_types = req.cache_key_types;
 
 		/* If no key types specified, use default (inode) */
 		if (key_types == 0)
 			key_types = LANDLOCK_CACHE_KEY_INODE;
+
+		/* Extract second path from audit2 if available */
+		if (request->has_audit2) {
+			switch (request->audit2.type) {
+			case LSM_AUDIT_DATA_PATH:
+				path2 = &request->audit2.u.path;
+				dentry2 = path2->dentry;
+				break;
+			case LSM_AUDIT_DATA_FILE:
+				if (request->audit2.u.file) {
+					path2 = &request->audit2.u.file->f_path;
+					dentry2 = path2->dentry;
+				}
+				break;
+			case LSM_AUDIT_DATA_DENTRY:
+				dentry2 = request->audit2.u.dentry;
+				break;
+			default:
+				break;
+			}
+		}
 
 		/*
 		 * Build composite cache key from all requested key types.
@@ -815,6 +988,11 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 		if (key_types & LANDLOCK_CACHE_KEY_INODE) {
 			if (dentry && dentry->d_inode)
 				keys.inode_key = (u64)(uintptr_t)dentry->d_inode;
+		}
+
+		if (key_types & LANDLOCK_CACHE_KEY_INODE2) {
+			if (dentry2 && dentry2->d_inode)
+				keys.inode2_key = (u64)(uintptr_t)dentry2->d_inode;
 		}
 
 		if (key_types & LANDLOCK_CACHE_KEY_PATH) {
@@ -830,10 +1008,21 @@ int landlock_supervisor_request_decision(struct landlock_supervisor *supervisor,
 			}
 		}
 
+		if (key_types & LANDLOCK_CACHE_KEY_PATH2) {
+			/* Use absolute path hash for second subject */
+			if (path2) {
+				char *path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+				if (path_buf) {
+					char *full_path = d_path(path2, path_buf, PATH_MAX);
+					if (!IS_ERR(full_path))
+						keys.path2_key = full_name_hash(NULL, full_path, strlen(full_path));
+					kfree(path_buf);
+				}
+			}
+		}
+
 		if (key_types & LANDLOCK_CACHE_KEY_PID)
 			keys.pid_key = (u64)task_tgid_nr(req.task);
-
-		/* Note: INODE2/PATH2 not supported in simplified model */
 
 		/* Store the key_types in the keys struct for cache insertion */
 		keys.key_types = key_types;

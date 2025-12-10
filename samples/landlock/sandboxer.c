@@ -254,10 +254,14 @@ static int run_supervisor(int supervisor_fd, pid_t child_pid)
 		struct landlock_supervisor_recv_fd recv_fd = {
 			.id = req.id,
 			.fd = -1,
-			.reserved = 0,
+			.fd2 = -1,
+			.flags = 0,
 		};
 		char path_buf[PATH_MAX] = "";
+		char path_buf2[PATH_MAX] = "";
 		bool has_fd = false;
+		bool has_fd2 = false;
+		bool has_subject2 = false;
 
 		/* Display the request to the user */
 		fprintf(stderr, "\n--- Access Request ---\n");
@@ -272,7 +276,7 @@ static int run_supervisor(int supervisor_fd, pid_t child_pid)
 			fprintf(stderr, " (0x%llx)\n",
 				(unsigned long long)req.access_request);
 
-			/* Get O_PATH fd for the actual subject if it exists */
+			/* Get O_PATH fds for the actual subjects if they exist */
 			ret = ioctl(supervisor_fd,
 				    LANDLOCK_IOCTL_SUPERVISOR_RECV_FD,
 				    &recv_fd);
@@ -280,21 +284,81 @@ static int run_supervisor(int supervisor_fd, pid_t child_pid)
 				fprintf(stderr,
 					"Warning: Failed to get subject fd: %s\n",
 					strerror(errno));
-			} else if (recv_fd.fd >= 0) {
-				get_path_from_fd(recv_fd.fd, path_buf,
-						 sizeof(path_buf));
-				fprintf(stderr, "Subject: %s\n", path_buf);
-				has_fd = true;
+			} else {
+				if (recv_fd.fd >= 0) {
+					get_path_from_fd(recv_fd.fd, path_buf,
+							 sizeof(path_buf));
+					/*
+					 * If we have a name and the fd is for parent dir,
+					 * show combined path. Check if name differs from
+					 * last component of path.
+					 */
+					if (recv_fd.name1_len > 0) {
+						char *last_slash = strrchr(path_buf, '/');
+						const char *basename = last_slash ? last_slash + 1 : path_buf;
+						if (strcmp(basename, recv_fd.name1) != 0) {
+							/* fd is for parent, show parent/name */
+							fprintf(stderr, "Subject: %s/%.*s\n",
+								path_buf,
+								(int)recv_fd.name1_len,
+								recv_fd.name1);
+						} else {
+							fprintf(stderr, "Subject: %s\n", path_buf);
+						}
+					} else {
+						fprintf(stderr, "Subject: %s\n", path_buf);
+					}
+					has_fd = true;
+				} else if (recv_fd.name1_len > 0) {
+					/* File doesn't exist yet (make_* op) but we have the name */
+					fprintf(stderr, "Subject: (new file: '%.*s')\n",
+						(int)recv_fd.name1_len, recv_fd.name1);
+				}
+				/* Check if there's a second subject */
+				if (recv_fd.flags & LANDLOCK_RECV_FD_FLAG_HAS_SUBJECT2) {
+					has_subject2 = true;
+					if (recv_fd.fd2 >= 0) {
+						get_path_from_fd(recv_fd.fd2, path_buf2,
+								 sizeof(path_buf2));
+						/*
+						 * If we have a name and the fd is for parent dir,
+						 * show combined path (e.g., /tmp/foo/fi2).
+						 */
+						if (recv_fd.name2_len > 0) {
+							char *last_slash = strrchr(path_buf2, '/');
+							const char *basename = last_slash ? last_slash + 1 : path_buf2;
+							if (strcmp(basename, recv_fd.name2) != 0) {
+								/* fd is for parent, show parent/name */
+								fprintf(stderr, "Subject2: %s/%.*s\n",
+									path_buf2,
+									(int)recv_fd.name2_len,
+									recv_fd.name2);
+							} else {
+								fprintf(stderr, "Subject2: %s\n", path_buf2);
+							}
+						} else {
+							fprintf(stderr, "Subject2: %s\n", path_buf2);
+						}
+						has_fd2 = true;
+					} else if (recv_fd.name2_len > 0) {
+						fprintf(stderr, "Subject2: (new file: '%.*s')\n",
+							(int)recv_fd.name2_len, recv_fd.name2);
+					} else {
+						fprintf(stderr, "Subject2: (new file - doesn't exist yet)\n");
+					}
+				}
 			}
 
 			/* If we didn't get an fd, the subject may not exist yet */
-			if (!has_fd) {
+			if (!has_fd && recv_fd.name1_len == 0) {
 				fprintf(stderr, "Subject: (unavailable)\n");
 			}
 
-			/* Clean up fd */
+			/* Clean up fds */
 			if (has_fd)
 				close(recv_fd.fd);
+			if (has_fd2)
+				close(recv_fd.fd2);
 		} else if (req.rule_type == LANDLOCK_RULE_NET_PORT) {
 			fprintf(stderr, "Type: Network access\n");
 			fprintf(stderr, "Access: ");
@@ -353,7 +417,16 @@ static int run_supervisor(int supervisor_fd, pid_t child_pid)
 				}
 				fprintf(stderr, "  [d] Process ID (PID: %u, TGID: %u)\n",
 					req.pid, req.tgid);
-				fprintf(stderr, "  [m] Multiple (e.g., 'ip' for inode+path)\n");
+				if (has_subject2) {
+					if (has_fd2) {
+						fprintf(stderr, "  [I] Inode2 (inode of %s)\n", path_buf2);
+						fprintf(stderr, "  [P] Path2 string (path: %s)\n", path_buf2);
+					} else {
+						fprintf(stderr, "  [I] Inode2 (not available - file doesn't exist)\n");
+						fprintf(stderr, "  [P] Path2 (not available - file doesn't exist)\n");
+					}
+				}
+				fprintf(stderr, "  [m] Multiple (e.g., 'ip' for inode+path, 'iI' for both inodes)\n");
 				fprintf(stderr, "Choice: ");
 				fflush(stderr);
 				
@@ -367,10 +440,20 @@ static int run_supervisor(int supervisor_fd, pid_t child_pid)
 							if (key_count++ > 0) strcat(key_info, " + ");
 							strcat(key_info, has_fd ? path_buf : "inode");
 							break;
+						case 'I':
+							resp.cache_key_types |= LANDLOCK_CACHE_KEY_INODE2;
+							if (key_count++ > 0) strcat(key_info, " + ");
+							strcat(key_info, has_fd2 ? path_buf2 : "inode2");
+							break;
 						case 'p':
 							resp.cache_key_types |= LANDLOCK_CACHE_KEY_PATH;
 							if (key_count++ > 0) strcat(key_info, " + ");
 							strcat(key_info, has_fd ? path_buf : "path");
+							break;
+						case 'P':
+							resp.cache_key_types |= LANDLOCK_CACHE_KEY_PATH2;
+							if (key_count++ > 0) strcat(key_info, " + ");
+							strcat(key_info, has_fd2 ? path_buf2 : "path2");
 							break;
 						case 'd':
 							resp.cache_key_types |= LANDLOCK_CACHE_KEY_PID;

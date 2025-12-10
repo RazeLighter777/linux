@@ -1275,8 +1275,21 @@ static int current_check_access_path(const struct path *const path,
 
 				/* Set up request for supervisor */
 				request.type = LANDLOCK_REQUEST_FS_ACCESS;
-				request.audit.type = LSM_AUDIT_DATA_PATH;
-				request.audit.u.path = *path;
+				/*
+				 * Use the actual file dentry if provided (for make_*
+				 * operations), otherwise use the path.
+				 */
+				if (dentry && dentry != path->dentry) {
+					struct path file_path = {
+						.mnt = path->mnt,
+						.dentry = dentry,
+					};
+					request.audit.type = LSM_AUDIT_DATA_PATH;
+					request.audit.u.path = file_path;
+				} else {
+					request.audit.type = LSM_AUDIT_DATA_PATH;
+					request.audit.u.path = *path;
+				}
 				request.access = access_request;
 
 				ret = landlock_supervisor_request_decision(
@@ -1647,6 +1660,14 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 			    request1.rule_flags.supervised_masks) {
 				u32 i;
 				int ret;
+				struct path old_path = {
+					.mnt = new_dir->mnt,
+					.dentry = old_dentry,
+				};
+				struct path dest_path = {
+					.mnt = new_dir->mnt,
+					.dentry = new_dentry,
+				};
 
 				for (i = 0; i < subject->domain->num_supervisors; i++) {
 					layer_mask_t layer_bit = BIT_ULL(i);
@@ -1656,10 +1677,14 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 					if (!subject->domain->supervisors[i])
 						continue;
 
-					/* Set up request for supervisor */
+					/* Set up request for supervisor with actual file paths */
 					request1.type = LANDLOCK_REQUEST_FS_ACCESS;
 					request1.audit.type = LSM_AUDIT_DATA_PATH;
-					request1.audit.u.path = *new_dir;
+					request1.audit.u.path = old_path;
+					/* Include destination for rename/link */
+					request1.audit2.type = LSM_AUDIT_DATA_PATH;
+					request1.audit2.u.path = dest_path;
+					request1.has_audit2 = true;
 					request1.access = access_request_parent1;
 
 					ret = landlock_supervisor_request_decision(
@@ -1717,6 +1742,10 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 				.mnt = new_dir->mnt,
 				.dentry = old_dentry,
 			};
+			struct path new_path = {
+				.mnt = new_dir->mnt,
+				.dentry = new_dentry,
+			};
 			u32 i;
 			int ret;
 
@@ -1732,6 +1761,10 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 				request1.type = LANDLOCK_REQUEST_FS_ACCESS;
 				request1.audit.type = LSM_AUDIT_DATA_PATH;
 				request1.audit.u.path = old_path;
+				/* Add second path for rename/link operations */
+				request1.audit2.type = LSM_AUDIT_DATA_PATH;
+				request1.audit2.u.path = new_path;
+				request1.has_audit2 = true;
 				request1.access = access_request_parent1 | access_request_parent2;
 
 				ret = landlock_supervisor_request_decision(

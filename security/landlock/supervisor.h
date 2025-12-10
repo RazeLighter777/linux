@@ -127,6 +127,15 @@ struct landlock_pending_req {
 	 */
 	u64 path_or_port;
 	/**
+	 * @name1: Captured filename of the primary subject at queue time.
+	 * This is needed because dentry names can change after queueing.
+	 */
+	char name1[256];
+	/**
+	 * @name2: Captured filename of the secondary subject at queue time.
+	 */
+	char name2[256];
+	/**
 	 * @task: The task that is blocked waiting for the decision.
 	 */
 	struct task_struct *task;
