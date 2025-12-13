@@ -1211,39 +1211,31 @@ static bool collect_domain_accesses(
 	return ret;
 }
 
+
+
 /**
- * get_sealed_layers_for_path - compute layers sealed against topology changes
- * @domain: Ruleset to consult.
- * @path: Path whose dentry is inspected.
- * @override_layers: Optional out parameter filled with non-sealing layers.
+ * deny_no_inherit_topology_change - deny topology changes on sealed paths
+ * @subject: Subject performing the operation (contains the domain).
+ * @dentry: Dentry that is the target of the topology modification.
  *
- * Inspect the rule tied to @path->dentry and return a mask of layers where the
- * dentry has either a no_inherit rule or was marked as having a descendant with
- * no_inherit.
- *
- * If @override_layers is not NULL, it is filled with the set of layers present
- * on @path->dentry that are not sealing.
- *
- * Returns a layer mask where set bits indicate layers that are "sealed"
- * (topology changes like rename/rmdir are denied) at @path->dentry.
+ * Checks whether any domain layers are sealed against topology changes at
+ * @dentry.  If so, emit an audit record and return -EACCES.  Otherwise return 0.
  */
-static layer_mask_t
-get_sealed_layers_for_path(const struct landlock_ruleset *const domain,
-			       const struct path *const path,
-			       layer_mask_t *const override_layers)
+static int deny_no_inherit_topology_change(const struct landlock_cred_security
+					   *subject,
+					   const struct path *const path)
 {
 	layer_mask_t sealed_layers = 0;
+	layer_mask_t override_layers = 0;
 	const struct landlock_rule *rule;
 	u32 layer_index;
+	unsigned long audit_layer_index;
 
-	if (override_layers)
-		*override_layers = 0;
-
-	if (WARN_ON_ONCE(!domain || !path || !path->dentry || !path->mnt ||
+	if (WARN_ON_ONCE(!subject || !path || !path->dentry || !path->mnt ||
 			 d_is_negative(path->dentry)))
 		return 0;
 
-	rule = find_rule(domain, path->dentry);
+	rule = find_rule(subject->domain, path->dentry);
 	if (!rule)
 		return 0;
 
@@ -1254,44 +1246,22 @@ get_sealed_layers_for_path(const struct landlock_ruleset *const domain,
 		if (layer->flags.no_inherit ||
 		    layer->flags.has_no_inherit_descendant)
 			sealed_layers |= layer_bit;
-		else if (override_layers)
-			*override_layers |= layer_bit;
+		else
+			override_layers |= layer_bit;
 	}
-	return sealed_layers;
-}
 
-/**
- * deny_no_inherit_topology_change - deny topology changes on sealed layers
- * @subject: Subject performing the operation (contains the domain).
- * @dentry: Dentry that is the target of the topology modification.
- *
- * Checks whether any domain layers are sealed against topology changes at
- * @dentry (via get_sealed_layers_for_path).  If so, emit an audit record
- * and return -EACCES.  Otherwise return 0.
- */
-static int deny_no_inherit_topology_change(const struct landlock_cred_security
-					   *subject,
-					   const struct path *const path)
-{
-	layer_mask_t sealed_layers;
-	layer_mask_t override_layers;
-	unsigned long layer_index;
-	if (WARN_ON_ONCE(!subject || !path || !path->dentry || !path->mnt ||
-			 d_is_negative(path->dentry)))
-		return 0;
-	sealed_layers = get_sealed_layers_for_path(subject->domain,
-					       path, &override_layers);
 	sealed_layers &= ~override_layers;
 	if (!sealed_layers)
 		return 0;
-	layer_index = __ffs((unsigned long)sealed_layers);
+
+	audit_layer_index = __ffs((unsigned long)sealed_layers);
 	landlock_log_denial(subject, &(struct landlock_request) {
 		.type = LANDLOCK_REQUEST_FS_CHANGE_TOPOLOGY,
 		.audit = {
 			.type = LSM_AUDIT_DATA_DENTRY,
 			.u.dentry = path->dentry,
 		},
-		.layer_plus_one = layer_index + 1,
+		.layer_plus_one = audit_layer_index + 1,
 	});
 	return -EACCES;
 }
