@@ -1209,10 +1209,10 @@ static bool collect_domain_accesses(
 /**
  * deny_no_inherit_topology_change - deny topology changes on sealed paths
  * @subject: Subject performing the operation (contains the domain).
- * @dentry: Dentry that is the target of the topology modification.
+ * @path: Path whose dentry is the target of the topology modification.
  *
  * Checks whether any domain layers are sealed against topology changes at
- * @dentry.  If so, emit an audit record and return -EACCES.  Otherwise return 0.
+ * @path.  If so, emit an audit record and return -EACCES.  Otherwise return 0.
  */
 static int deny_no_inherit_topology_change(const struct landlock_cred_security
 					   *subject,
