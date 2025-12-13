@@ -4685,7 +4685,7 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 	static const char file2_s1d2[] = TMP_DIR "/s1d1/s1d2/f2";
 
 	/* Create a second file in the same directory as file1_s1d2 */
-	ASSERT_EQ(0, mknod(file2_s1d2, S_IFREG | 0600, 0));
+	create_file(_metadata, file2_s1d2);
 
 	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
 	ASSERT_LE(0, ruleset_fd);
