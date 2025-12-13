@@ -325,11 +325,9 @@ enum landlock_walk_result {
 
 static enum landlock_walk_result landlock_walk_path_up(struct path *const path)
 {
-jump_up:
-	if (path->dentry == path->mnt->mnt_root) {
-		if (follow_up(path))
-			goto jump_up;
-		return LANDLOCK_WALK_STOP_REAL_ROOT;
+	while (path->dentry == path->mnt->mnt_root) {
+		if (!follow_up(path))
+			return LANDLOCK_WALK_STOP_REAL_ROOT;
 	}
 
 	if (unlikely(IS_ROOT(path->dentry))) {
