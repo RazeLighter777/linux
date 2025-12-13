@@ -376,7 +376,6 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 	if (IS_ERR(id.key.object))
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
-	
 	/* Validate all ancestor directories first for NO_INHERIT rules */
 	if (flags & LANDLOCK_ADD_RULE_NO_INHERIT) {
 		struct path walker;
