@@ -1203,8 +1203,6 @@ static bool collect_domain_accesses(
 	return ret;
 }
 
-
-
 /**
  * deny_no_inherit_topology_change - deny topology changes on sealed paths
  * @subject: Subject performing the operation (contains the domain).
