@@ -4691,18 +4691,20 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 	ASSERT_LE(0, ruleset_fd);
 
 	/*
-	 * Add a NO_INHERIT rule on file1_s1d2 with RO access.
+	 * Add a NO_INHERIT rule on file1_s1d2 with READ_FILE access.
 	 * This should succeed (files can have NO_INHERIT).
+	 * Use READ_FILE (not ACCESS_RO which includes READ_DIR) since
+	 * directory access rights don't make sense for files.
 	 */
-	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, file1_s1d2,
-			 LANDLOCK_ADD_RULE_NO_INHERIT);
+	add_path_beneath(_metadata, ruleset_fd, LANDLOCK_ACCESS_FS_READ_FILE,
+			 file1_s1d2, LANDLOCK_ADD_RULE_NO_INHERIT);
 
 	enforce_ruleset(_metadata, ruleset_fd);
 	ASSERT_EQ(0, close(ruleset_fd));
 
 	/*
-	 * file1_s1d2 has NO_INHERIT, so it should only have RO access
-	 * (not inheriting RW from parent TMP_DIR).
+	 * file1_s1d2 has NO_INHERIT with READ_FILE access only,
+	 * so it should only be readable (not inheriting RW from parent TMP_DIR).
 	 */
 	ASSERT_EQ(0, test_open(file1_s1d2, O_RDONLY));
 	ASSERT_EQ(EACCES, test_open(file1_s1d2, O_WRONLY));
