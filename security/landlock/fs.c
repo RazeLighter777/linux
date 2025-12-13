@@ -453,6 +453,7 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 				path_put(&walker);
 				goto out_unlock;
 			}
+			/* Validate rule structure before attempting to modify it */
 			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1)) {
 				err = -EINVAL;
 				path_put(&walker);
@@ -480,8 +481,10 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 
 			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
 			/* Already validated in first pass, should not fail */
-			if (!WARN_ON_ONCE(IS_ERR(ancestor_rule) || !ancestor_rule))
-				ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
+			if (WARN_ON_ONCE(IS_ERR(ancestor_rule) || !ancestor_rule ||
+					 ancestor_rule->num_layers != 1))
+				continue;
+			ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
 		}
 		path_put(&walker);
 	}
