@@ -338,12 +338,10 @@ static enum landlock_walk_result landlock_walk_path_up(struct path *const path)
 		return LANDLOCK_WALK_CONTINUE;
 	}
 
-	{
-		struct dentry *const parent = dget_parent(path->dentry);
+	struct dentry *const parent = dget_parent(path->dentry);
 
-		dput(path->dentry);
-		path->dentry = parent;
-	}
+	dput(path->dentry);
+	path->dentry = parent;
 	return LANDLOCK_WALK_CONTINUE;
 }
 
