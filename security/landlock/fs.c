@@ -352,60 +352,6 @@ jump_up:
 static const struct landlock_rule *find_rule(const struct landlock_ruleset *const domain,
 					     const struct dentry *const dentry);
 
-/**
- * ensure_rule_for_dentry - ensure a ruleset contains a rule entry for dentry,
- * inserting a blank rule if needed.
- * @ruleset: Ruleset to modify/inspect.  Caller must hold @ruleset->lock.
- * @dentry: Dentry to ensure a rule exists for.
- *
- * If no rule is currently associated with @dentry, insert an empty rule
- * (with zero access) tied to the backing inode.  Returns a pointer to the
- * rule associated with @dentry on success, NULL when @dentry is negative, or
- * an ERR_PTR()-encoded error if the rule cannot be created.
- *
- * This is useful for LANDLOCK_ADD_RULE_NO_INHERIT processing, where a rule
- * may need to be created for an ancestor dentry that does not yet have one
- * to properly track no_inherit flags.
- *
- * The flags are set to zero if a rule is newly created, and the caller
- * is responsible for setting them appropriately.
- *
- * The returned rule pointer's lifetime is tied to @ruleset.
- */
-static struct landlock_rule *
-ensure_rule_for_dentry(struct landlock_ruleset *const ruleset,
-		       struct dentry *const dentry)
-{
-	struct landlock_id id = {
-		.type = LANDLOCK_KEY_INODE,
-	};
-	struct landlock_rule *rule;
-	int err;
-
-	if (WARN_ON_ONCE(!ruleset || !dentry || d_is_negative(dentry)))
-		return NULL;
-
-	lockdep_assert_held(&ruleset->lock);
-
-	rule = (struct landlock_rule *)find_rule(ruleset, dentry);
-	if (rule)
-		return rule;
-
-	id.key.object = get_inode_object(d_backing_inode(dentry));
-	if (IS_ERR(id.key.object))
-		return ERR_CAST(id.key.object);
-
-	err = landlock_insert_rule(ruleset, id, 0, 0);
-	landlock_put_object(id.key.object);
-	if (err)
-		return ERR_PTR(err);
-
-	rule = (struct landlock_rule *)find_rule(ruleset, dentry);
-	if (WARN_ON_ONCE(!rule))
-		return ERR_PTR(-ENOENT);
-	return rule;
-}
-
 /*
  * @path: Should have been checked by get_path_from_fd().
  */
@@ -442,19 +388,45 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		path_get(&walker);
 		while (true) {
 			struct landlock_rule *ancestor_rule;
+			struct landlock_id ancestor_id = {
+				.type = LANDLOCK_KEY_INODE,
+			};
 
 			walk_res = landlock_walk_path_up(&walker);
 			if (walk_res != LANDLOCK_WALK_CONTINUE)
 				break;
 
-			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
-			if (IS_ERR(ancestor_rule)) {
-				err = PTR_ERR(ancestor_rule);
+			if (WARN_ON_ONCE(!walker.dentry || d_is_negative(walker.dentry))) {
+				err = -EINVAL;
 				path_put(&walker);
 				goto out_unlock;
 			}
+
+			ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
+			if (!ancestor_rule) {
+				ancestor_id.key.object = get_inode_object(d_backing_inode(walker.dentry));
+				if (IS_ERR(ancestor_id.key.object)) {
+					err = PTR_ERR(ancestor_id.key.object);
+					path_put(&walker);
+					goto out_unlock;
+				}
+
+				err = landlock_insert_rule(ruleset, ancestor_id, 0, 0);
+				landlock_put_object(ancestor_id.key.object);
+				if (err) {
+					path_put(&walker);
+					goto out_unlock;
+				}
+
+				ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
+				if (WARN_ON_ONCE(!ancestor_rule)) {
+					err = -ENOENT;
+					path_put(&walker);
+					goto out_unlock;
+				}
+			}
 			/* Validate rule structure before attempting to modify it */
-			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1)) {
+			if (WARN_ON_ONCE(ancestor_rule->num_layers != 1)) {
 				err = -EINVAL;
 				path_put(&walker);
 				goto out_unlock;
@@ -474,20 +446,38 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		path_get(&walker);
 		while (true) {
 			struct landlock_rule *ancestor_rule;
+			struct landlock_id ancestor_id = {
+				.type = LANDLOCK_KEY_INODE,
+			};
 
 			walk_res = landlock_walk_path_up(&walker);
 			if (walk_res != LANDLOCK_WALK_CONTINUE)
 				break;
 
-			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
+			if (WARN_ON_ONCE(!walker.dentry || d_is_negative(walker.dentry)))
+				continue;
+
+			ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
+			if (!ancestor_rule) {
+				ancestor_id.key.object = get_inode_object(d_backing_inode(walker.dentry));
+				if (IS_ERR(ancestor_id.key.object))
+					continue;
+
+				if (landlock_insert_rule(ruleset, ancestor_id, 0, 0)) {
+					landlock_put_object(ancestor_id.key.object);
+					continue;
+				}
+				landlock_put_object(ancestor_id.key.object);
+
+				ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
+			}
 			/*
 			 * Already validated in first pass, should not fail.
 			 * If it does, continue setting flags on remaining ancestors
 			 * since the main rule is already inserted and can't be
 			 * rolled back.
 			 */
-			if (WARN_ON_ONCE(IS_ERR(ancestor_rule) || !ancestor_rule ||
-					 ancestor_rule->num_layers != 1))
+			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1))
 				continue;
 			ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
 		}
