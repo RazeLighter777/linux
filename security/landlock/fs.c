@@ -480,7 +480,12 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 				break;
 
 			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
-			/* Already validated in first pass, should not fail */
+			/*
+			 * Already validated in first pass, should not fail.
+			 * If it does, continue setting flags on remaining ancestors
+			 * since the main rule is already inserted and can't be
+			 * rolled back.
+			 */
 			if (WARN_ON_ONCE(IS_ERR(ancestor_rule) || !ancestor_rule ||
 					 ancestor_rule->num_layers != 1))
 				continue;
