@@ -439,7 +439,7 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		struct path walker;
 		enum landlock_walk_result walk_res;
 
-		/* Set has_no_inherit_descendant flags on all ancestors */
+		/* Set has_no_inherit_descendant flags on all ancestors once initial rule insertion succeeds */
 		walker = *path;
 		path_get(&walker);
 		while (true) {
@@ -469,12 +469,6 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 
 				ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
 			}
-			/*
-			 * Already validated in first pass, should not fail.
-			 * If it does, continue setting flags on remaining ancestors
-			 * since the main rule is already inserted and can't be
-			 * rolled back.
-			 */
 			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1))
 				continue;
 			ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
