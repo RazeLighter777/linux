@@ -432,8 +432,9 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 	if (IS_ERR(id.key.object))
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
-	err = landlock_insert_rule(ruleset, id, access_rights, flags);
-	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
+	
+	/* Validate all ancestor directories first for NO_INHERIT rules */
+	if (flags & LANDLOCK_ADD_RULE_NO_INHERIT) {
 		struct path walker;
 		enum landlock_walk_result walk_res;
 
@@ -449,16 +450,42 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
 			if (IS_ERR(ancestor_rule)) {
 				err = PTR_ERR(ancestor_rule);
-				break;
+				path_put(&walker);
+				goto out_unlock;
 			}
 			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1)) {
 				err = -EINVAL;
-				break;
+				path_put(&walker);
+				goto out_unlock;
 			}
-			ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
 		}
 		path_put(&walker);
 	}
+
+	/* Insert the main rule only after validating ancestors */
+	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+	if (!err && (flags & LANDLOCK_ADD_RULE_NO_INHERIT)) {
+		struct path walker;
+		enum landlock_walk_result walk_res;
+
+		/* Set has_no_inherit_descendant flags on all ancestors */
+		walker = *path;
+		path_get(&walker);
+		while (true) {
+			struct landlock_rule *ancestor_rule;
+
+			walk_res = landlock_walk_path_up(&walker);
+			if (walk_res != LANDLOCK_WALK_CONTINUE)
+				break;
+
+			ancestor_rule = ensure_rule_for_dentry(ruleset, walker.dentry);
+			/* Already validated in first pass, should not fail */
+			if (!WARN_ON_ONCE(IS_ERR(ancestor_rule) || !ancestor_rule))
+				ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
+		}
+		path_put(&walker);
+	}
+out_unlock:
 	mutex_unlock(&ruleset->lock);
 	/*
 	 * No need to check for an error because landlock_insert_rule()
