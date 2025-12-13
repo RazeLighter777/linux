@@ -451,25 +451,32 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 			if (walk_res != LANDLOCK_WALK_CONTINUE)
 				break;
 
-			if (WARN_ON_ONCE(!walker.dentry || d_is_negative(walker.dentry)))
-				continue;
+			if (WARN_ON_ONCE(!walker.dentry || d_is_negative(walker.dentry))) {
+				err = -EIO;
+				break;
+			}
 
 			ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
 			if (!ancestor_rule) {
 				ancestor_id.key.object = get_inode_object(d_backing_inode(walker.dentry));
-				if (IS_ERR(ancestor_id.key.object))
-					continue;
+				if (IS_ERR(ancestor_id.key.object)) {
+					err = PTR_ERR(ancestor_id.key.object);
+					break;
+				}
 
 				if (landlock_insert_rule(ruleset, ancestor_id, 0, 0)) {
 					landlock_put_object(ancestor_id.key.object);
-					continue;
+					err = -EIO;
+					break;
 				}
 				landlock_put_object(ancestor_id.key.object);
 
 				ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
 			}
-			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1))
-				continue;
+			if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1)) {
+				err = -EIO;
+				break;
+			}
 			ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
 		}
 		path_put(&walker);
