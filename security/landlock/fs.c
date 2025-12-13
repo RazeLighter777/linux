@@ -1181,12 +1181,11 @@ static bool collect_domain_accesses(
 	walker = *dir;
 	path_get(&walker);
 	while (true) {
-		const struct landlock_rule *rule = find_rule(domain, walker.dentry);
 		enum landlock_walk_result walk_res;
 
 		/* Gets all layers allowing all domain accesses. */
 		if (landlock_unmask_layers(
-			    rule, access_dom, layer_masks_dom,
+			    find_rule(domain, walker.dentry), access_dom, layer_masks_dom,
 			    ARRAY_SIZE(*layer_masks_dom), rule_flags)) {
 			/*
 			 * Stops when all handled accesses are allowed by at
