@@ -1165,7 +1165,7 @@ static bool collect_domain_accesses(
 	layer_mask_t (*const layer_masks_dom)[LANDLOCK_NUM_ACCESS_FS],
 	struct collected_rule_flags *const rule_flags)
 {
-	access_mask_t access_dom;
+	unsigned long access_dom;
 	bool ret = false;
 	struct path walker;
 
