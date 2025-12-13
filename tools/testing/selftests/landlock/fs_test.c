@@ -4682,10 +4682,12 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 		{},
 	};
 	int ruleset_fd;
-	static const char file2_s1d2[] = TMP_DIR "/s1d1/s1d2/f2";
 
-	/* Create a second file in the same directory as file1_s1d2 */
-	ASSERT_EQ(0, mknod(file2_s1d2, S_IFREG | 0600, 0));
+	/*
+	 * Both file1_s1d2 and file2_s1d2 already exist from the fixture.
+	 * file2_s1d2 is in the same directory as file1_s1d2 and will be
+	 * used to test inheritance vs. NO_INHERIT behavior.
+	 */
 
 	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
 	ASSERT_LE(0, ruleset_fd);
@@ -4715,9 +4717,6 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 	 */
 	ASSERT_EQ(0, test_open(file2_s1d2, O_RDONLY));
 	ASSERT_EQ(0, test_open(file2_s1d2, O_WRONLY));
-
-	/* Cleanup */
-	ASSERT_EQ(0, unlink(file2_s1d2));
 }
 
 TEST_F_FORK(layout1, inherit_no_inherit_layered)
