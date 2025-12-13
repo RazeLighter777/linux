@@ -4682,21 +4682,40 @@ TEST_F_FORK(layout1, inherit_no_inherit_topology_file)
 		{},
 	};
 	int ruleset_fd;
-	struct landlock_path_beneath_attr path_beneath = {
-		.allowed_access = ACCESS_RO,
-	};
+	static const char file2_s1d2[] = TMP_DIR "/s1d1/s1d2/f2";
+
+	/* Create a second file in the same directory as file1_s1d2 */
+	ASSERT_EQ(0, mknod(file2_s1d2, S_IFREG | 0600, 0));
 
 	ruleset_fd = create_ruleset(_metadata, ACCESS_RW, rules);
 	ASSERT_LE(0, ruleset_fd);
 
-	path_beneath.parent_fd = open(file1_s1d2, O_PATH | O_CLOEXEC);
-	ASSERT_LE(0, path_beneath.parent_fd);
-	ASSERT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
-					&path_beneath,
-					LANDLOCK_ADD_RULE_NO_INHERIT));
-	ASSERT_EQ(EINVAL, errno);
-	ASSERT_EQ(0, close(path_beneath.parent_fd));
+	/*
+	 * Add a NO_INHERIT rule on file1_s1d2 with RO access.
+	 * This should succeed (files can have NO_INHERIT).
+	 */
+	add_path_beneath(_metadata, ruleset_fd, ACCESS_RO, file1_s1d2,
+			 LANDLOCK_ADD_RULE_NO_INHERIT);
+
+	enforce_ruleset(_metadata, ruleset_fd);
 	ASSERT_EQ(0, close(ruleset_fd));
+
+	/*
+	 * file1_s1d2 has NO_INHERIT, so it should only have RO access
+	 * (not inheriting RW from parent TMP_DIR).
+	 */
+	ASSERT_EQ(0, test_open(file1_s1d2, O_RDONLY));
+	ASSERT_EQ(EACCES, test_open(file1_s1d2, O_WRONLY));
+
+	/*
+	 * file2_s1d2 does not have NO_INHERIT, so it should inherit
+	 * RW access from parent TMP_DIR rule.
+	 */
+	ASSERT_EQ(0, test_open(file2_s1d2, O_RDONLY));
+	ASSERT_EQ(0, test_open(file2_s1d2, O_WRONLY));
+
+	/* Cleanup */
+	ASSERT_EQ(0, unlink(file2_s1d2));
 }
 
 TEST_F_FORK(layout1, inherit_no_inherit_layered)
