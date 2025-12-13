@@ -7877,7 +7877,7 @@ TEST_F(audit_layout1, no_inherit_parent_is_logged)
 	EXPECT_EQ(0, close(ruleset_fd));
 }
 
-TEST_F(audit_layout1, no_inherit_blocks_quiet_flag_inheritence)
+TEST_F(audit_layout1, no_inherit_blocks_quiet_flag_inheritance)
 {
 	struct audit_records records;
 	struct landlock_ruleset_attr ruleset_attr = {
