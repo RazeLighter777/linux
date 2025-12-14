@@ -1346,10 +1346,10 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		get_mode_access(d_backing_inode(old_dentry)->i_mode);
 	if (removable) {
 		int err;
-
 		err = deny_no_inherit_topology_change(
 			subject,
 			&(struct path){ .mnt = new_dir->mnt, .dentry = old_dentry });
+
 		if (err)
 			return err;
 		if (exchange) {
