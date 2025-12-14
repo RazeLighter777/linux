@@ -1349,7 +1349,6 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		err = deny_no_inherit_topology_change(
 			subject,
 			&(struct path){ .mnt = new_dir->mnt, .dentry = old_dentry });
-
 		if (err)
 			return err;
 		if (exchange) {
@@ -1754,7 +1753,6 @@ static int hook_path_unlink(const struct path *const dir,
 	const struct landlock_cred_security *const subject =
 		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
 	int err;
-
 	if (subject) {
 		err = deny_no_inherit_topology_change(
 			subject,
@@ -1771,7 +1769,6 @@ static int hook_path_rmdir(const struct path *const dir,
 	const struct landlock_cred_security *const subject =
 		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
 	int err;
-
 	if (subject) {
 		err = deny_no_inherit_topology_change(
 			subject,
