@@ -49,6 +49,7 @@
 #include "object.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "supervisor.h"
 
 /* Underlying object management */
 
@@ -1054,8 +1055,14 @@ static int current_check_access_path(const struct path *const path,
 						   LANDLOCK_KEY_INODE);
 	if (is_access_to_paths_allowed(subject->domain, path, access_request,
 				       &layer_masks, &request, NULL, 0, NULL,
-				       NULL, NULL))
+				       NULL, NULL)) {
+#ifdef CONFIG_AUDIT
+		return landlock_supervisor_enforce_fs(subject->domain, path,
+						 access_request);
+#else
 		return 0;
+#endif
+	}
 
 	landlock_log_denial(subject, &request);
 	return -EACCES;

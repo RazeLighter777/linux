@@ -62,6 +62,15 @@ struct landlock_details {
 	char exe_path[];
 };
 
+#ifdef CONFIG_AUDIT
+struct landlock_supervisor;
+void landlock_put_supervisor(struct landlock_supervisor *supervisor);
+#else
+static inline void landlock_put_supervisor(void *supervisor)
+{
+}
+#endif
+
 /* Adds 11 extra characters for the potential " (deleted)" suffix. */
 #define LANDLOCK_PATH_MAX_SIZE (PATH_MAX + 11)
 
@@ -85,6 +94,7 @@ struct landlock_hierarchy {
 	refcount_t usage;
 
 #ifdef CONFIG_AUDIT
+
 	/**
 	 * @log_status: Whether this domain should be logged or not.  Because
 	 * concurrent log entries may be created at the same time, it is still
@@ -100,6 +110,10 @@ struct landlock_hierarchy {
 	 * @id: Landlock domain ID, sets once at domain creation time.
 	 */
 	u64 id;
+	/**
+	 * @layer_ruleset_id: ID of the ruleset merged to create this domain layer.
+	 */
+	u64 layer_ruleset_id;
 	/**
 	 * @details: Information about the related domain.
 	 */
@@ -119,6 +133,10 @@ struct landlock_hierarchy {
 	 * logged) if the related object is marked as quiet.
 	 */
 	struct access_masks quiet_masks;
+	/**
+	 * @supervisor: Optional supervisor for this domain layer.
+	 */
+	struct landlock_supervisor *supervisor;
 #endif /* CONFIG_AUDIT */
 };
 
@@ -176,6 +194,7 @@ static inline void landlock_put_hierarchy(struct landlock_hierarchy *hierarchy)
 
 		landlock_log_drop_domain(hierarchy);
 		landlock_free_hierarchy_details(hierarchy);
+		landlock_put_supervisor(hierarchy->supervisor);
 		hierarchy = hierarchy->parent;
 		kfree(freeme);
 	}

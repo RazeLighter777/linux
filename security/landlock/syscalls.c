@@ -35,7 +35,9 @@
 #include "limits.h"
 #include "net.h"
 #include "ruleset.h"
+#include "syscalls.h"
 #include "setup.h"
+#include "supervisor.h"
 
 static bool is_initialized(void)
 {
@@ -151,7 +153,7 @@ static ssize_t fop_dummy_write(struct file *const filp,
  * reentrant design is also used in a read way to enforce the ruleset on the
  * current task.
  */
-static const struct file_operations ruleset_fops = {
+const struct file_operations landlock_ruleset_fops = {
 	.release = fop_ruleset_release,
 	.read = fop_dummy_read,
 	.write = fop_dummy_write,
@@ -273,7 +275,7 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
 	ruleset->quiet_masks.scope = ruleset_attr.quiet_scoped;
 
 	/* Creates anonymous FD referring to the ruleset. */
-	ruleset_fd = anon_inode_getfd("[landlock-ruleset]", &ruleset_fops,
+	ruleset_fd = anon_inode_getfd("[landlock-ruleset]", &landlock_ruleset_fops,
 				      ruleset, O_RDWR | O_CLOEXEC);
 	if (ruleset_fd < 0)
 		landlock_put_ruleset(ruleset);
@@ -284,8 +286,7 @@ SYSCALL_DEFINE3(landlock_create_ruleset,
  * Returns an owned ruleset from a FD. It is thus needed to call
  * landlock_put_ruleset() on the return value.
  */
-static struct landlock_ruleset *get_ruleset_from_fd(const int fd,
-						    const fmode_t mode)
+struct landlock_ruleset *landlock_get_ruleset_from_fd(int fd, fmode_t mode)
 {
 	CLASS(fd, ruleset_f)(fd);
 	struct landlock_ruleset *ruleset;
@@ -294,7 +295,7 @@ static struct landlock_ruleset *get_ruleset_from_fd(const int fd,
 		return ERR_PTR(-EBADF);
 
 	/* Checks FD type and access right. */
-	if (fd_file(ruleset_f)->f_op != &ruleset_fops)
+	if (fd_file(ruleset_f)->f_op != &landlock_ruleset_fops)
 		return ERR_PTR(-EBADFD);
 	if (!(fd_file(ruleset_f)->f_mode & mode))
 		return ERR_PTR(-EPERM);
@@ -310,7 +311,7 @@ static struct landlock_ruleset *get_ruleset_from_fd(const int fd,
 /*
  * @path: Must call put_path(@path) after the call if it succeeded.
  */
-static int get_path_from_fd(const s32 fd, struct path *const path)
+int landlock_get_path_from_fd(s32 fd, struct path *path)
 {
 	CLASS(fd_raw, f)(fd);
 
@@ -324,7 +325,7 @@ static int get_path_from_fd(const s32 fd, struct path *const path)
 	 * pseudo filesystems that will never be mountable (e.g. sockfs,
 	 * pipefs).
 	 */
-	if ((fd_file(f)->f_op == &ruleset_fops) ||
+	if ((fd_file(f)->f_op == &landlock_ruleset_fops) ||
 	    (fd_file(f)->f_path.mnt->mnt_flags & MNT_INTERNAL) ||
 	    (fd_file(f)->f_path.dentry->d_sb->s_flags & SB_NOUSER) ||
 	    IS_PRIVATE(d_backing_inode(fd_file(f)->f_path.dentry)))
@@ -367,7 +368,7 @@ static int add_rule_path_beneath(struct landlock_ruleset *const ruleset,
 		return -EINVAL;
 
 	/* Gets and checks the new rule. */
-	err = get_path_from_fd(path_beneath_attr.parent_fd, &path);
+	err = landlock_get_path_from_fd(path_beneath_attr.parent_fd, &path);
 	if (err)
 		return err;
 
@@ -475,7 +476,7 @@ SYSCALL_DEFINE4(landlock_add_rule, const int, ruleset_fd,
 		return -EINVAL;
 
 	/* Gets and checks the ruleset. */
-	ruleset = get_ruleset_from_fd(ruleset_fd, FMODE_CAN_WRITE);
+	ruleset = landlock_get_ruleset_from_fd(ruleset_fd, FMODE_CAN_WRITE);
 	if (IS_ERR(ruleset))
 		return PTR_ERR(ruleset);
 
@@ -500,6 +501,7 @@ SYSCALL_DEFINE4(landlock_add_rule, const int, ruleset_fd,
  *         - %LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF
  *         - %LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON
  *         - %LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF
+ *         - %LANDLOCK_RESTRICT_SELF_SUPERVISE (requires %CONFIG_AUDIT)
  *
  * This system call enables to enforce a Landlock ruleset on the current
  * thread.  Enforcing a ruleset requires that the task has %CAP_SYS_ADMIN in its
@@ -530,6 +532,8 @@ SYSCALL_DEFINE2(landlock_restrict_self, const int, ruleset_fd, const __u32,
 	struct landlock_cred_security *new_llcred;
 	bool __maybe_unused log_same_exec, log_new_exec, log_subdomains,
 		prev_log_subdomains;
+	int __maybe_unused supervisor_fd = -1;
+	bool __maybe_unused supervise;
 
 	if (!is_initialized())
 		return -EOPNOTSUPP;
@@ -553,14 +557,20 @@ SYSCALL_DEFINE2(landlock_restrict_self, const int, ruleset_fd, const __u32,
 	/* Translates "off" flag to boolean. */
 	log_subdomains = !(flags & LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF);
 
+#ifdef CONFIG_AUDIT
+	supervise = !!(flags & LANDLOCK_RESTRICT_SELF_SUPERVISE);
+#endif /* CONFIG_AUDIT */
+
 	/*
 	 * It is allowed to set LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF with
 	 * -1 as ruleset_fd, but no other flag must be set.
 	 */
-	if (!(ruleset_fd == -1 &&
-	      flags == LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF)) {
+	if (ruleset_fd == -1) {
+		if (flags != LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF)
+			return -EINVAL;
+	} else {
 		/* Gets and checks the ruleset. */
-		ruleset = get_ruleset_from_fd(ruleset_fd, FMODE_CAN_READ);
+		ruleset = landlock_get_ruleset_from_fd(ruleset_fd, FMODE_CAN_READ);
 		if (IS_ERR(ruleset))
 			return PTR_ERR(ruleset);
 	}
@@ -604,6 +614,17 @@ SYSCALL_DEFINE2(landlock_restrict_self, const int, ruleset_fd, const __u32,
 		new_dom->hierarchy->log_status = LANDLOCK_LOG_DISABLED;
 #endif /* CONFIG_AUDIT */
 
+#ifdef CONFIG_AUDIT
+	if (supervise) {
+		supervisor_fd = landlock_create_supervisor_fd(new_dom);
+		if (supervisor_fd < 0) {
+			landlock_put_ruleset(new_dom);
+			abort_creds(new_cred);
+			return supervisor_fd;
+		}
+	}
+#endif /* CONFIG_AUDIT */
+
 	/* Replaces the old (prepared) domain. */
 	landlock_put_ruleset(new_llcred->domain);
 	new_llcred->domain = new_dom;
@@ -612,5 +633,11 @@ SYSCALL_DEFINE2(landlock_restrict_self, const int, ruleset_fd, const __u32,
 	new_llcred->domain_exec |= BIT(new_dom->num_layers - 1);
 #endif /* CONFIG_AUDIT */
 
-	return commit_creds(new_cred);
+	commit_creds(new_cred);
+
+#ifdef CONFIG_AUDIT
+	if (supervise)
+		return supervisor_fd;
+#endif /* CONFIG_AUDIT */
+	return 0;
 }

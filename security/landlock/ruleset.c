@@ -7,6 +7,7 @@
  */
 
 #include <linux/bits.h>
+#include <linux/atomic.h>
 #include <linux/bug.h>
 #include <linux/cleanup.h>
 #include <linux/compiler_types.h>
@@ -30,6 +31,11 @@
 #include "limits.h"
 #include "object.h"
 #include "ruleset.h"
+#include "tag.h"
+
+#ifdef CONFIG_AUDIT
+static atomic64_t landlock_ruleset_id_counter = ATOMIC64_INIT(0);
+#endif /* CONFIG_AUDIT */
 
 static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 {
@@ -49,6 +55,10 @@ static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	new_ruleset->num_layers = num_layers;
+
+#ifdef CONFIG_AUDIT
+	new_ruleset->id = atomic64_inc_return(&landlock_ruleset_id_counter);
+#endif /* CONFIG_AUDIT */
 	/*
 	 * hierarchy = NULL
 	 * num_rules = 0
@@ -172,6 +182,20 @@ static void free_rule(struct landlock_rule *const rule,
 	might_sleep();
 	if (!rule)
 		return;
+
+#ifdef CONFIG_AUDIT
+	for (size_t layer_level = 0; layer_level < rule->num_layers; layer_level++) {
+		struct landlock_tag_node *node = rule->layers[layer_level].tags;
+
+		while (node) {
+			struct landlock_tag_node *next = node->next;
+
+			landlock_put_tag(node->tag);
+			kfree(node);
+			node = next;
+		}
+	}
+#endif /* CONFIG_AUDIT */
 	if (is_object_pointer(key_type))
 		landlock_put_object(rule->key.object);
 	kfree(rule);
@@ -277,6 +301,14 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 				       &(*layers)[0]);
 		if (IS_ERR(new_rule))
 			return PTR_ERR(new_rule);
+
+#ifdef CONFIG_AUDIT
+		/* Preserve per-layer tags from the existing rule. */
+		for (size_t i = 0; i < this->num_layers; i++) {
+			new_rule->layers[i].tags = this->layers[i].tags;
+			this->layers[i].tags = NULL;
+		}
+#endif /* CONFIG_AUDIT */
 		rb_replace_node(&this->node, &new_rule->node, root);
 		free_rule(this, id.type);
 		return 0;
@@ -324,7 +356,10 @@ int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 			.no_inherit = !!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
 			.has_no_inherit_descendant =
 				!!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
-		}
+		},
+#ifdef CONFIG_AUDIT
+		.tags = NULL,
+#endif /* CONFIG_AUDIT */
 	} };
 
 	build_check_layer();
@@ -581,6 +616,10 @@ landlock_merge_ruleset(struct landlock_ruleset *const parent,
 		return ERR_PTR(-ENOMEM);
 
 	refcount_set(&new_dom->hierarchy->usage, 1);
+
+#ifdef CONFIG_AUDIT
+	new_dom->hierarchy->layer_ruleset_id = ruleset->id;
+#endif /* CONFIG_AUDIT */
 
 	/* ...as a child of @parent... */
 	err = inherit_ruleset(parent, new_dom);

@@ -10,6 +10,7 @@
 #ifndef _UAPI_LINUX_LANDLOCK_H
 #define _UAPI_LINUX_LANDLOCK_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
 
 /**
@@ -210,11 +211,20 @@ struct landlock_ruleset_attr {
  *     future nested domains, not the one being created. It can also be used
  *     with a @ruleset_fd value of -1 to mute subdomain logs without creating a
  *     domain.
+ *
+ * %LANDLOCK_RESTRICT_SELF_SUPERVISE
+ *     Returns a supervisor file descriptor for the newly created Landlock
+ *     domain.  This file descriptor will later be used with ioctls to
+ *     interactively gate accesses relying on Landlock audit events.
+ *
+ *     When this flag is set, sys_landlock_restrict_self() returns a non-negative
+ *     file descriptor on success instead of 0.
  */
 /* clang-format off */
 #define LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF		(1U << 0)
 #define LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON			(1U << 1)
 #define LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF		(1U << 2)
+#define LANDLOCK_RESTRICT_SELF_SUPERVISE			(1U << 3)
 /* clang-format on */
 
 /**
@@ -283,6 +293,193 @@ struct landlock_net_port_attr {
 	 */
 	__u64 port;
 };
+
+/**
+ * enum landlock_tag_expr_op - Tag expression operator
+ *
+ * Used to build a tag matcher tree passed to supervisor ioctls.
+ */
+enum landlock_tag_expr_op {
+	LANDLOCK_TAG_EXPR_PIDFD = 1,
+	LANDLOCK_TAG_EXPR_EXEC_FD,
+	LANDLOCK_TAG_EXPR_AND,
+	LANDLOCK_TAG_EXPR_OR,
+};
+
+/**
+ * struct landlock_tag_expr - Serialized tag expression node
+ *
+ * Leaf nodes use @fd. Composite nodes use @left and @right indices.
+ */
+struct landlock_tag_expr {
+	/**
+	 * @op: One of enum landlock_tag_expr_op.
+	 */
+	__u32 op;
+	/**
+	 * @flags: Reserved for future use, must be 0.
+	 */
+	__u32 flags;
+	/**
+	 * @fd: File descriptor used by leaf nodes.
+	 */
+	__s32 fd;
+	/**
+	 * @pad: Reserved for alignment, must be 0.
+	 */
+	__u32 pad;
+	/**
+	 * @left: Left child node index for composite nodes.
+	 */
+	__u32 left;
+	/**
+	 * @right: Right child node index for composite nodes.
+	 */
+	__u32 right;
+};
+
+/**
+ * struct landlock_tag_tree_attr - Tag matcher tree
+ */
+struct landlock_tag_tree_attr {
+	/**
+	 * @nodes: User pointer to an array of &struct landlock_tag_expr.
+	 */
+	__u64 nodes;
+	/**
+	 * @nodes_len: Number of elements in @nodes.
+	 */
+	__u32 nodes_len;
+	/**
+	 * @root: Root node index.
+	 */
+	__u32 root;
+};
+
+/**
+ * struct landlock_supervisor_set_subruleset_attr - Supervisor rule update
+ *
+ * Argument of %LANDLOCK_SUPERVISOR_SET_SUBRULESET.
+ */
+struct landlock_supervisor_set_subruleset_attr {
+	/**
+	 * @ruleset_fd: Ruleset file descriptor identifying the layer to update.
+	 */
+	__s32 ruleset_fd;
+	/**
+	 * @subruleset_fd: Ruleset file descriptor to attach as subruleset.
+	 */
+	__s32 subruleset_fd;
+	/**
+	 * @rule_type: Identify the structure type stored in @rule_attr.
+	 */
+	__u32 rule_type;
+	/**
+	 * @flags: Reserved for future use, must be 0.
+	 */
+	__u32 flags;
+	/**
+	 * @tag_tree: Tag matcher expression tree.
+	 *
+	 * If @tag_tree.nodes_len is 0, the tag matcher defaults to an empty tag
+	 * (matches all requests).
+	 */
+	struct landlock_tag_tree_attr tag_tree;
+	/**
+	 * @rule_attr: Rule attribute matching @rule_type.
+	 */
+	union {
+		struct landlock_path_beneath_attr path_beneath;
+		struct landlock_net_port_attr net_port;
+	} rule_attr;
+};
+
+/* clang-format off */
+#define LANDLOCK_SUPERVISOR_SET_SUBRULESET	_IOW('L', 0x10, struct landlock_supervisor_set_subruleset_attr)
+/* clang-format on */
+
+
+/**
+ * struct landlock_supervisor_eventfd_attr - Register eventfd for supervision
+ *
+ * Argument of %LANDLOCK_SUPERVISOR_SET_EVENTFD.
+ */
+struct landlock_supervisor_eventfd_attr {
+	/**
+	 * @event_fd: eventfd used for notification.
+	 */
+	__s32 event_fd;
+	/**
+	 * @flags: Reserved for future use, must be 0.
+	 */
+	__u32 flags;
+};
+
+/**
+ * struct landlock_supervisor_event - Pending supervisor decision event
+ *
+ * Argument of %LANDLOCK_SUPERVISOR_RECV_EVENT.
+ */
+struct landlock_supervisor_event {
+	/**
+	 * @cookie: Opaque identifier for this event.
+	 */
+	__u64 cookie;
+	/**
+	 * @request_type: One of enum landlock_request_type.
+	 */
+	__u32 request_type;
+	/**
+	 * @rule_type: One of enum landlock_rule_type.
+	 */
+	__u32 rule_type;
+	/**
+	 * @access: Requested access mask (filesystem or network).
+	 */
+	__u64 access;
+	/**
+	 * @tgid: Thread-group id of the requesting task.
+	 */
+	__u32 tgid;
+	/**
+	 * @flags: Reserved for future use.
+	 */
+	__u32 flags;
+	/**
+	 * @ino: Inode number for filesystem events (0 otherwise).
+	 */
+	__u64 ino;
+	/**
+	 * @port: TCP port for network events in host endianness (0 otherwise).
+	 */
+	__u64 port;
+};
+
+/**
+ * struct landlock_supervisor_decide_attr - Reply to a supervisor event
+ *
+ * Argument of %LANDLOCK_SUPERVISOR_DECIDE.
+ */
+struct landlock_supervisor_decide_attr {
+	/**
+	 * @cookie: Opaque identifier previously returned in &struct landlock_supervisor_event.
+	 */
+	__u64 cookie;
+	/**
+	 * @flags: Reserved for future use, must be 0.
+	 */
+	__u32 flags;
+	/**
+	 * @allow: 0 to deny, 1 to allow.
+	 */
+	__u32 allow;
+};
+
+/* clang-format off */
+#define LANDLOCK_SUPERVISOR_SET_EVENTFD	_IOW('L', 0x20, struct landlock_supervisor_eventfd_attr)
+#define LANDLOCK_SUPERVISOR_RECV_EVENT	_IOR('L', 0x21, struct landlock_supervisor_event)
+#define LANDLOCK_SUPERVISOR_DECIDE	_IOW('L', 0x22, struct landlock_supervisor_decide_attr)
+/* clang-format on */
 
 /**
  * DOC: fs_access

@@ -18,6 +18,7 @@
 #include "limits.h"
 #include "net.h"
 #include "ruleset.h"
+#include "supervisor.h"
 
 int landlock_append_net_rule(struct landlock_ruleset *const ruleset,
 			     const u16 port, access_mask_t access_rights,
@@ -181,8 +182,14 @@ static int current_check_access_socket(struct socket *const sock,
 						   access_request, &layer_masks,
 						   LANDLOCK_KEY_NET_PORT);
 	if (landlock_unmask_layers(rule, access_request, &layer_masks,
-				   ARRAY_SIZE(layer_masks), &rule_flags))
+			   ARRAY_SIZE(layer_masks), &rule_flags)) {
+#ifdef CONFIG_AUDIT
+		return landlock_supervisor_enforce_net(subject->domain, ntohs(port),
+						  access_request);
+#else
 		return 0;
+#endif
+	}
 
 	audit_net.family = address->sa_family;
 	landlock_log_denial(subject,

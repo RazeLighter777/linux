@@ -22,6 +22,11 @@
 
 struct landlock_hierarchy;
 
+#ifdef CONFIG_AUDIT
+struct landlock_tag;
+struct landlock_tag_node;
+#endif /* CONFIG_AUDIT */
+
 /**
  * struct landlock_layer - Access rights for a given layer
  */
@@ -55,6 +60,13 @@ struct landlock_layer {
 		 */
 		bool has_no_inherit_descendant:1;
 	} flags;
+
+#ifdef CONFIG_AUDIT
+	/**
+	 * @tags: Optional list of supervisor tags associated with this layer.
+	 */
+	struct landlock_tag_node *tags;
+#endif /* CONFIG_AUDIT */
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
 	 * relative to the object type (e.g. %LANDLOCK_ACTION_FS_READ).
@@ -187,6 +199,13 @@ struct landlock_ruleset {
 	 * domain vanishes.  This is needed for the ptrace protection.
 	 */
 	struct landlock_hierarchy *hierarchy;
+
+#ifdef CONFIG_AUDIT
+	/**
+	 * @id: Unique ID for a ruleset, used to identify a domain layer.
+	 */
+	u64 id;
+#endif /* CONFIG_AUDIT */
 	union {
 		/**
 		 * @work_free: Enables to free a ruleset within a lockless
