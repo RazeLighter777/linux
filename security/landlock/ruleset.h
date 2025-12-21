@@ -319,12 +319,14 @@ landlock_get_scope_mask(const struct landlock_ruleset *const ruleset,
 }
 
 /**
- * struct layer_accesses - A boolean matrix of layers and access rights
+ * struct layer_access_masks - A boolean matrix of layers and access rights
  *
  * This has a bit for each combination of layer numbers and access rights.
  * During access checks, it is used to represent the access rights for each
  * layer which still need to be fulfilled.  When all bits are 0, the access
  * request is considered to be fulfilled.
+ *
+ * @access: Array of access masks for each layer.
  */
 struct layer_access_masks {
 	access_mask_t access[LANDLOCK_MAX_NUM_LAYERS];
