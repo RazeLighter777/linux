@@ -1103,19 +1103,11 @@ static access_mask_t maybe_remove(const struct dentry *const dentry)
  * - true if all the domain access rights are allowed for @dir;
  * - false if the walk reached @mnt_root.
  */
-<<<<<<< HEAD
 static bool collect_domain_accesses(const struct landlock_ruleset *const domain,
 				    const struct dentry *const mnt_root,
 				    struct dentry *dir,
 				    struct layer_access_masks *layer_masks_dom,
 				    struct collected_rule_flags *const rule_flags)
-=======
-static bool collect_domain_accesses(
-	const struct landlock_ruleset *const domain,
-	const struct path *const dir,
-	layer_mask_t (*const layer_masks_dom)[LANDLOCK_NUM_ACCESS_FS],
-	struct collected_rule_flags *const rule_flags)
->>>>>>> landlock: Implement LANDLOCK_ADD_RULE_NO_INHERIT
 {
 	unsigned long access_dom;
 	bool ret = false;
@@ -1136,15 +1128,9 @@ static bool collect_domain_accesses(
 		enum landlock_walk_result walk_res;
 
 		/* Gets all layers allowing all domain accesses. */
-<<<<<<< HEAD
-		if (landlock_unmask_layers(find_rule(domain, dir),
-					   layer_masks_dom,
-					   rule_flags)) {
-=======
 		if (landlock_unmask_layers(
 			    find_rule(domain, walker.dentry), access_dom, layer_masks_dom,
 			    ARRAY_SIZE(*layer_masks_dom), rule_flags)) {
->>>>>>> landlock: Implement LANDLOCK_ADD_RULE_NO_INHERIT
 			/*
 			 * Stops when all handled accesses are allowed by at
 			 * least one rule in each layer.
