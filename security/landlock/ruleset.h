@@ -40,6 +40,20 @@ struct landlock_layer {
 		 * down the file hierarchy.
 		 */
 		bool quiet:1;
+		/**
+		 * @no_inherit: Prevents this rule from inheriting access rights
+		 * from ancestor inodes. Only used for filesystem rules.
+		 */
+		bool no_inherit:1;
+		/**
+		 * @has_no_inherit_descendant: Marker to indicate that this layer
+		 * has at least one descendant directory with a rule having the
+		 * no_inherit flag.  Only used for filesystem rules.
+		 * This "flag" is not set by the user, but by Landlock on
+		 * parent directories of rules when the child rule has
+		 * a rule with the no_inherit flag to deny topology changes.
+		 */
+		bool has_no_inherit_descendant:1;
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -340,6 +354,15 @@ struct collected_rule_flags {
 	 * @quiet_masks: Layers for which the quiet flag is effective.
 	 */
 	struct layer_access_masks quiet_masks;
+	/**
+	 * @has_no_inherit_descendant_masks: Layers for which the
+	 * has_no_inherit_descendant flag is effective.
+	 */
+	struct layer_access_masks has_no_inherit_descendant_masks;
+	/**
+	 * @no_inherit_masks: Layers for which the no_inherit flag is effective.
+	 */
+	struct layer_access_masks no_inherit_masks;
 };
 
 bool landlock_unmask_layers(const struct landlock_rule *const rule,
