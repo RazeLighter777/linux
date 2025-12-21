@@ -254,6 +254,11 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 			if (WARN_ON_ONCE(this->layers[0].level != 0))
 				return -EINVAL;
 			this->layers[0].access |= (*layers)[0].access;
+			/* Merge the flags into the rules */
+			this->layers[0].flags.no_inherit |=
+				(*layers)[0].flags.no_inherit;
+			this->layers[0].flags.has_no_inherit_descendant |=
+				(*layers)[0].flags.has_no_inherit_descendant;
 			return 0;
 		}
 
@@ -304,12 +309,18 @@ static void build_check_layer(void)
 /* @ruleset must be locked by the caller. */
 int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 			 const struct landlock_id id,
-			 const access_mask_t access)
+			 const access_mask_t access,
+			 int flags)
 {
 	struct landlock_layer layers[] = { {
 		.access = access,
 		/* When @level is zero, insert_rule() extends @ruleset. */
 		.level = 0,
+		.flags = {
+			.no_inherit = !!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+			.has_no_inherit_descendant =
+				!!(flags & LANDLOCK_ADD_RULE_NO_INHERIT),
+		}
 	} };
 
 	build_check_layer();
@@ -350,6 +361,7 @@ static int merge_tree(struct landlock_ruleset *const dst,
 			return -EINVAL;
 
 		layers[0].access = walker_rule->layers[0].access;
+		layers[0].flags = walker_rule->layers[0].flags;
 
 		err = insert_rule(dst, id, &layers, ARRAY_SIZE(layers));
 		if (err)
@@ -632,7 +644,15 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 	for (int i = 0; i < rule->num_layers; i++) {
 		const struct landlock_layer *l = &rule->layers[i];
 
+		/*
+		 * Skip layers that already have no_inherit set - these layers
+		 * should not inherit access rights from ancestor directories.
+		 */
+		if (rule_flags && (rule_flags->no_inherit & BIT(l->level - 1)))
+			continue;
+
 		masks->access[l->level - 1] &= ~l->access;
+
 		/* Collect rule flags for each layer. */
 		if (rule_flags && l->flags.no_inherit)
 			rule_flags->no_inherit |= BIT(l->level - 1);

@@ -48,7 +48,6 @@ struct landlock_layer {
 		 * a rule with the no_inherit flag to deny topology changes.
 		 */
 		bool has_no_inherit_descendant:1;
-
 	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
@@ -222,7 +221,8 @@ DEFINE_FREE(landlock_put_ruleset, struct landlock_ruleset *,
 
 int landlock_insert_rule(struct landlock_ruleset *const ruleset,
 			 const struct landlock_id id,
-			 const access_mask_t access);
+			 const access_mask_t access,
+			 int flags);
 
 struct landlock_ruleset *
 landlock_merge_ruleset(struct landlock_ruleset *const parent,
