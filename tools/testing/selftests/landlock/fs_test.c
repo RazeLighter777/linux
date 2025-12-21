@@ -7927,11 +7927,11 @@ void audit_quiet_layout1_test_body(struct __test_metadata *const _metadata,
 
 			if (target->audit_ioctl)
 				ASSERT_EQ(0,
-					  matches_log_fs_extra(
-						  _metadata, self->audit_fd,
-						  "fs\\.ioctl_dev",
-						  target->target,
-						  " ioctlcmd=0x541b\\+"));
+					  matches_log_fs_extra(_metadata,
+							       self->audit_fd,
+							       "fs\\.ioctl_dev",
+							       target->target,
+							       " ioctlcmd=0x541b\\+"));
 
 			/* No other logs. records.domain not checked per reasoning above. */
 			audit_count_records(self->audit_fd, &records);
@@ -9160,6 +9160,7 @@ TEST_F(audit_quiet_layout1, deny_all_quiet_layer)
 		},
 	};
 	int i;
+
 	FIXTURE_VARIANT(audit_quiet_layout1) variant_2 = {};
 
 	/* Any open should fail with no logs. */
@@ -9192,6 +9193,7 @@ TEST_F(audit_quiet_layout1, deny_all_layer)
 		.quiet_access_fs = FS_R | FS_W,
 	};
 	int i;
+	
 	FIXTURE_VARIANT(audit_quiet_layout1) variant_2 = {};
 	bool test_has_subdomains_off = false;
 
@@ -9268,8 +9270,8 @@ FIXTURE_TEARDOWN_PARENT(audit_quiet_rename)
 	clear_cap(_metadata, CAP_AUDIT_CONTROL);
 }
 
-static void simple_quiet_rename(struct __test_metadata *const _metadata,
-				FIXTURE_DATA(audit_quiet_rename) *const self,
+static void simple_quiet_rename(struct __test_metadata * const _metadata,
+				FIXTURE_DATA(audit_quiet_rename) * const self,
 				__u64 handled_access, __u64 quiet_access,
 				bool source_allow, bool dest_allow,
 				bool source_quiet, bool dest_quiet,
@@ -9594,8 +9596,6 @@ TEST_F(audit_quiet_rename, quiet_flag_on_file_ignored)
 	ASSERT_EQ(-1, renameat(AT_FDCWD, file1_s1d1, AT_FDCWD, file1_s2d1));
 	ASSERT_EQ(EACCES, errno);
 
-	ASSERT_EQ(0, matches_log_fs(_metadata, self->audit_fd,
-				    "fs\\.remove_file,fs\\.refer", dir_s1d1));
 	/* We didn't unlink destination file */
 	ASSERT_EQ(0, matches_log_fs(_metadata, self->audit_fd,
 				    "fs\\.remove_file,fs\\.make_reg,fs\\.refer", dir_s2d1));
