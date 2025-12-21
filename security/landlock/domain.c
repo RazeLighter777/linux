@@ -152,6 +152,30 @@ landlock_get_fs_deny_masks(const access_mask_t optional_access,
 	return ((ioctl_dev_layer << 4) & 0xf0) | (truncate_layer & 0x0f);
 }
 
+/**
+ * landlock_get_quiet_optional_accesses - Get optional accesses which are
+ * "covered" by quiet rule flags.
+ *
+ * Returns a bitmask of which optional accesses are denied by layers for
+ * which rule_flags.quiet_masks has the corresponding layer bit set.
+ * Bit 0 = truncate quiet, Bit 1 = ioctl_dev quiet.
+ */
+optional_access_t landlock_get_quiet_optional_accesses(
+	const deny_masks_t deny_masks,
+	const struct collected_rule_flags rule_flags)
+{
+	optional_access_t quiet_optional_accesses = 0;
+	u8 truncate_layer = deny_masks & 0x0f;
+	u8 ioctl_dev_layer = (deny_masks & 0xf0) >> 4;
+
+	if (rule_flags.quiet_masks.access[truncate_layer])
+		quiet_optional_accesses |= BIT(0);
+	if (rule_flags.quiet_masks.access[ioctl_dev_layer])
+		quiet_optional_accesses |= BIT(1);
+
+	return quiet_optional_accesses;
+}
+
 #ifdef CONFIG_SECURITY_LANDLOCK_KUNIT_TEST
 
 static void test_landlock_get_fs_deny_masks(struct kunit *const test)
