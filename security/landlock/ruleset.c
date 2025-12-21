@@ -621,7 +621,8 @@ landlock_find_rule(const struct landlock_ruleset *const ruleset,
  * request are empty).
  */
 bool landlock_unmask_layers(const struct landlock_rule *const rule,
-			    struct layer_access_masks *masks)
+			    struct layer_access_masks *masks,
+			    struct collected_rule_flags *const rule_flags)
 {
 	if (!masks)
 		return true;
@@ -632,6 +633,10 @@ bool landlock_unmask_layers(const struct landlock_rule *const rule,
 		const struct landlock_layer *l = &rule->layers[i];
 
 		masks->access[l->level - 1] &= ~l->access;
+		/* Collect rule flags for each layer. */
+		if (rule_flags && l->flags.quiet)
+			rule_flags->quiet_masks.access[l->level - 1] |=
+				BIT_ULL(l->level - 1);
 	}
 
 	for (int i = 0; i < LANDLOCK_MAX_NUM_LAYERS; i++) {
