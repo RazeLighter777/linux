@@ -617,6 +617,11 @@ void landlock_log_denial(const struct landlock_cred_security *const subject,
 				!!(quiet_mask &
 				   LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET);
 			break;
+		case LANDLOCK_REQUEST_SCOPE_PATHNAME_UNIX_SOCKET:
+			quiet_applicable_to_access =
+				!!(quiet_mask &
+				   LANDLOCK_SCOPE_PATHNAME_UNIX_SOCKET);
+			break;
 		/*
 		 * Leave LANDLOCK_REQUEST_PTRACE and
 		 * LANDLOCK_REQUEST_FS_CHANGE_TOPOLOGY unhandled for now - they are

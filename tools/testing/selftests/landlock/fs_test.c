@@ -9193,7 +9193,7 @@ TEST_F(audit_quiet_layout1, deny_all_layer)
 		.quiet_access_fs = FS_R | FS_W,
 	};
 	int i;
-	
+
 	FIXTURE_VARIANT(audit_quiet_layout1) variant_2 = {};
 	bool test_has_subdomains_off = false;
 
