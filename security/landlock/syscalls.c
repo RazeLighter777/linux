@@ -20,10 +20,15 @@
 #include <linux/fs.h>
 #include <linux/limits.h>
 #include <linux/mount.h>
+#include <linux/overflow.h>
 #include <linux/path.h>
+#include <linux/pid.h>
 #include <linux/sched.h>
 #include <linux/security.h>
+#include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/stddef.h>
+#include <linux/string.h>
 #include <linux/syscalls.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -36,6 +41,435 @@
 #include "net.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "super_table.h"
+#include "supervisor.h"
+#include "tag.h"
+
+static const struct file_operations ruleset_fops;
+
+static int landlock_supervisor_tag_cmp(const void *p1, const void *p2)
+{
+	const struct landlock_supervisor_tag *a = p1;
+	const struct landlock_supervisor_tag *b = p2;
+
+	if (a->type != b->type)
+		return (int)a->type - (int)b->type;
+
+	switch (a->type) {
+	case LANDLOCK_SUPERVISOR_TAG_NONE:
+		return 0;
+	case LANDLOCK_SUPERVISOR_TAG_PIDFD:
+		if (a->pid < b->pid)
+			return -1;
+		if (a->pid > b->pid)
+			return 1;
+		return 0;
+	case LANDLOCK_SUPERVISOR_TAG_EXEC_DENTRY:
+		if (a->exec_dentry < b->exec_dentry)
+			return -1;
+		if (a->exec_dentry > b->exec_dentry)
+			return 1;
+		return 0;
+	}
+
+	return 0;
+}
+
+static bool tag_in_sorted_set(const struct landlock_supervisor_tag *tags,
+			      const u32 num_tags,
+			      const struct landlock_supervisor_tag *tag)
+{
+	u32 l = 0, r = num_tags;
+
+	while (l < r) {
+		u32 m = l + ((r - l) >> 1);
+		int c = landlock_supervisor_tag_cmp(tag, &tags[m]);
+
+		if (!c)
+			return true;
+		if (c < 0)
+			r = m;
+		else
+			l = m + 1;
+	}
+	return false;
+}
+
+static void free_supervisor_tags(struct landlock_supervisor_tag *tags,
+				 u32 num_tags)
+{
+	u32 i;
+
+	if (!tags)
+		return;
+	for (i = 0; i < num_tags; i++)
+		landlock_supervisor_tag_destroy(&tags[i]);
+	kfree(tags);
+}
+
+static int build_supervisor_tags_from_user(
+	struct landlock_supervisor_tag **tags_out, u32 *num_tags_out,
+	const struct landlock_supervisor_ruleset_tags_attr *attr)
+{
+	struct landlock_supervisor_tag_attr *u_tags;
+	struct landlock_supervisor_tag *tags;
+	size_t bytes;
+	u32 i, out = 0;
+
+	if (!tags_out || !num_tags_out || !attr)
+		return -EINVAL;
+
+	*tags_out = NULL;
+	*num_tags_out = 0;
+
+	if (!attr->num_tags)
+		return 0;
+	if (!attr->tags)
+		return -EFAULT;
+
+	if (check_mul_overflow((size_t)attr->num_tags, sizeof(*u_tags), &bytes))
+		return -E2BIG;
+
+	u_tags = memdup_user((const void __user *)(uintptr_t)attr->tags, bytes);
+	if (IS_ERR(u_tags))
+		return PTR_ERR(u_tags);
+
+	tags = kcalloc(attr->num_tags, sizeof(*tags), GFP_KERNEL_ACCOUNT);
+	if (!tags) {
+		kfree(u_tags);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < attr->num_tags; i++) {
+		int err;
+
+		landlock_supervisor_tag_init(&tags[i]);
+
+		switch (u_tags[i].type) {
+		case LANDLOCK_SUPERVISOR_TAG_NONE:
+			err = 0;
+			break;
+		case LANDLOCK_SUPERVISOR_TAG_PIDFD: {
+			CLASS(fd, pidf)(u_tags[i].pidfd);
+			struct pid *pid;
+
+			if (fd_empty(pidf)) {
+				pr_warn_ratelimited(
+					"landlock: supervisor SET_TAGS: bad pidfd=%d (pid=%d tgid=%d)\n",
+					u_tags[i].pidfd, task_pid_nr(current), task_tgid_nr(current));
+				err = -EBADFD;
+				break;
+			}
+			pid = pidfd_pid(fd_file(pidf));
+			if (IS_ERR(pid)) {
+				err = PTR_ERR(pid);
+				break;
+			}
+			err = landlock_supervisor_tag_set_pid(&tags[i], pid);
+			break;
+		}
+		case LANDLOCK_SUPERVISOR_TAG_EXEC_DENTRY: {
+			CLASS(fd, exef)(u_tags[i].exec_fd);
+
+			if (fd_empty(exef)) {
+				pr_warn_ratelimited(
+					"landlock: supervisor SET_TAGS: bad exec_fd=%d (pid=%d tgid=%d)\n",
+					u_tags[i].exec_fd, task_pid_nr(current), task_tgid_nr(current));
+				err = -EBADFD;
+				break;
+			}
+			err = landlock_supervisor_tag_set_exec_dentry(
+				&tags[i], fd_file(exef)->f_path.dentry);
+			break;
+		}
+		default:
+			err = -EINVAL;
+			break;
+		}
+
+		if (err) {
+			free_supervisor_tags(tags, i + 1);
+			kfree(u_tags);
+			return err;
+		}
+	}
+	kfree(u_tags);
+
+	sort(tags, attr->num_tags, sizeof(*tags), landlock_supervisor_tag_cmp,
+	     NULL);
+
+	for (i = 0; i < attr->num_tags; i++) {
+		if (out && landlock_supervisor_tag_equal(&tags[out - 1], &tags[i])) {
+			landlock_supervisor_tag_destroy(&tags[i]);
+			memset(&tags[i], 0, sizeof(tags[i]));
+			continue;
+		}
+		if (out != i) {
+			tags[out] = tags[i];
+			memset(&tags[i], 0, sizeof(tags[i]));
+		}
+		out++;
+	}
+
+	*tags_out = tags;
+	*num_tags_out = out;
+	return 0;
+}
+
+static long ruleset_ioctl_set_tags(struct file *filp, unsigned long arg)
+{
+	struct landlock_supervisor_ruleset_tags_attr attr;
+	struct landlock_supervisor_tag *new_tags = NULL;
+	u32 new_num_tags = 0;
+	struct landlock_ruleset *ruleset = filp->private_data;
+	struct landlock_ruleset *domain;
+	struct landlock_cred_security *llcred;
+	struct landlock_super_table *table;
+	struct landlock_supervisor_tag *old_tags;
+	u32 old_num_tags;
+	u32 i;
+	int err;
+
+	if (copy_from_user(&attr, (const void __user *)arg, sizeof(attr)))
+		return -EFAULT;
+	if (attr.size < sizeof(attr))
+		return -EINVAL;
+
+	/* Ensures the passed ruleset_fd matches the calling file. */
+	{
+		CLASS(fd, rf)(attr.ruleset_fd);
+
+		if (fd_empty(rf))
+			return -EBADF;
+		if (fd_file(rf) != filp)
+			return -EBADFD;
+		if (fd_file(rf)->f_op != &ruleset_fops)
+			return -EBADFD;
+	}
+
+	if (WARN_ON_ONCE(!ruleset))
+		return -EINVAL;
+	if (WARN_ON_ONCE(ruleset->num_layers != 1))
+		return -EINVAL;
+
+	err = build_supervisor_tags_from_user(&new_tags, &new_num_tags, &attr);
+	if (err)
+		return err;
+
+	llcred = landlock_cred(current_cred());
+	domain = llcred->domain;
+	if (!domain) {
+		free_supervisor_tags(new_tags, new_num_tags);
+		return -EINVAL;
+	}
+
+	mutex_lock(&domain->lock);
+	if (!domain->super_table) {
+		domain->super_table = landlock_super_table_create();
+		if (!domain->super_table) {
+			mutex_unlock(&domain->lock);
+			free_supervisor_tags(new_tags, new_num_tags);
+			return -ENOMEM;
+		}
+	}
+	table = domain->super_table;
+	mutex_unlock(&domain->lock);
+
+	mutex_lock(&ruleset->lock);
+	old_tags = ruleset->supervisor_tags;
+	old_num_tags = ruleset->num_supervisor_tags;
+
+	/* First add any newly introduced tags. */
+	for (i = 0; i < new_num_tags; i++) {
+		if (tag_in_sorted_set(old_tags, old_num_tags, &new_tags[i]))
+			continue;
+		err = landlock_super_table_add(table, &new_tags[i], ruleset);
+		if (err)
+			goto out_unlock_ruleset;
+	}
+
+	/* Then delete removed tags (including full removal if new list is empty). */
+	for (i = 0; i < old_num_tags; i++) {
+		if (tag_in_sorted_set(new_tags, new_num_tags, &old_tags[i]))
+			continue;
+		landlock_super_table_del(table, &old_tags[i], ruleset);
+	}
+
+	ruleset->supervisor_tags = new_tags;
+	ruleset->num_supervisor_tags = new_num_tags;
+	new_tags = NULL;
+	new_num_tags = 0;
+
+	free_supervisor_tags(old_tags, old_num_tags);
+	err = 0;
+
+out_unlock_ruleset:
+	mutex_unlock(&ruleset->lock);
+	free_supervisor_tags(new_tags, new_num_tags);
+	return err;
+}
+
+static long ruleset_ioctl_swap_ruleset(struct file *filp, unsigned long arg)
+{
+	struct landlock_supervisor_ruleset_swap_attr attr;
+	struct landlock_ruleset *old_ruleset = filp->private_data;
+	struct landlock_ruleset *new_ruleset;
+	struct landlock_cred_security *llcred;
+	struct landlock_ruleset *domain;
+	struct landlock_super_table *table;
+	struct landlock_supervisor_tag *new_prev_tags;
+	u32 new_prev_num;
+	int err;
+
+	if (copy_from_user(&attr, (const void __user *)arg, sizeof(attr)))
+		return -EFAULT;
+	if (attr.size < sizeof(attr))
+		return -EINVAL;
+	if (attr.old_ruleset_fd == attr.new_ruleset_fd)
+		return -EINVAL;
+
+	/* Ensures the passed old_ruleset_fd matches the calling file. */
+	{
+		CLASS(fd, of)(attr.old_ruleset_fd);
+
+		if (fd_empty(of))
+			return -EBADF;
+		if (fd_file(of) != filp)
+			return -EBADFD;
+		if (fd_file(of)->f_op != &ruleset_fops)
+			return -EBADFD;
+	}
+
+	{
+		CLASS(fd, nf)(attr.new_ruleset_fd);
+
+		if (fd_empty(nf))
+			return -EBADF;
+		if (fd_file(nf)->f_op != &ruleset_fops)
+			return -EBADFD;
+		new_ruleset = fd_file(nf)->private_data;
+	}
+
+	if (WARN_ON_ONCE(!old_ruleset || !new_ruleset))
+		return -EINVAL;
+	if (WARN_ON_ONCE(old_ruleset->num_layers != 1 || new_ruleset->num_layers != 1))
+		return -EINVAL;
+
+	llcred = landlock_cred(current_cred());
+	domain = llcred->domain;
+	if (!domain)
+		return -EINVAL;
+	if (!domain->super_table)
+		return -ENOENT;
+	table = domain->super_table;
+
+	/* Lock rulesets while swapping their stored tag lists. */
+	if (old_ruleset < new_ruleset) {
+		mutex_lock(&old_ruleset->lock);
+		mutex_lock(&new_ruleset->lock);
+	} else {
+		mutex_lock(&new_ruleset->lock);
+		mutex_lock(&old_ruleset->lock);
+	}
+
+	if (!old_ruleset->num_supervisor_tags) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	new_prev_tags = new_ruleset->supervisor_tags;
+	new_prev_num = new_ruleset->num_supervisor_tags;
+
+	err = landlock_super_table_swap_ruleset(table, old_ruleset, new_ruleset,
+				      new_prev_tags, new_prev_num);
+	if (err)
+		goto out_unlock;
+
+	/* Update per-ruleset tag lists to keep them consistent with the table. */
+	new_ruleset->supervisor_tags = old_ruleset->supervisor_tags;
+	new_ruleset->num_supervisor_tags = old_ruleset->num_supervisor_tags;
+	old_ruleset->supervisor_tags = NULL;
+	old_ruleset->num_supervisor_tags = 0;
+
+	free_supervisor_tags(new_prev_tags, new_prev_num);
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&old_ruleset->lock);
+	mutex_unlock(&new_ruleset->lock);
+	return err;
+}
+
+static long ruleset_ioctl_supervisor_listen(struct file *filp, unsigned long arg)
+{
+	struct landlock_supervisor_listen_attr attr;
+	struct landlock_ruleset *ruleset = filp->private_data;
+
+	if (copy_from_user(&attr, (const void __user *)arg, sizeof(attr)))
+		return -EFAULT;
+	if (attr.size < sizeof(attr))
+		return -EINVAL;
+	if (WARN_ON_ONCE(!ruleset))
+		return -EINVAL;
+
+	return landlock_supervisor_ruleset_listen(ruleset, &attr);
+}
+
+static long ruleset_ioctl_supervisor_recv(struct file *filp, unsigned long arg)
+{
+	struct landlock_supervisor_event event;
+	struct landlock_ruleset *ruleset = filp->private_data;
+	long err;
+
+	if (copy_from_user(&event, (const void __user *)arg, sizeof(event)))
+		return -EFAULT;
+	if (event.size < sizeof(event))
+		return -EINVAL;
+	if (WARN_ON_ONCE(!ruleset))
+		return -EINVAL;
+
+	err = landlock_supervisor_ruleset_recv(ruleset, &event);
+	if (err)
+		return err;
+
+	if (copy_to_user((void __user *)arg, &event, sizeof(event)))
+		return -EFAULT;
+	return 0;
+}
+
+static long ruleset_ioctl_supervisor_decide(struct file *filp, unsigned long arg)
+{
+	struct landlock_supervisor_decide_attr attr;
+	struct landlock_ruleset *ruleset = filp->private_data;
+
+	if (copy_from_user(&attr, (const void __user *)arg, sizeof(attr)))
+		return -EFAULT;
+	if (attr.size < sizeof(attr))
+		return -EINVAL;
+	if (WARN_ON_ONCE(!ruleset))
+		return -EINVAL;
+
+	return landlock_supervisor_ruleset_decide(ruleset, &attr);
+}
+
+static long landlock_ruleset_ioctl(struct file *filp, unsigned int cmd,
+				 unsigned long arg)
+{
+	switch (cmd) {
+	case LANDLOCK_IOC_SUPERVISOR_SET_TAGS:
+		return ruleset_ioctl_set_tags(filp, arg);
+	case LANDLOCK_IOC_SUPERVISOR_SWAP_RULESET:
+		return ruleset_ioctl_swap_ruleset(filp, arg);
+	case LANDLOCK_IOC_SUPERVISOR_LISTEN:
+		return ruleset_ioctl_supervisor_listen(filp, arg);
+	case LANDLOCK_IOC_SUPERVISOR_RECV:
+		return ruleset_ioctl_supervisor_recv(filp, arg);
+	case LANDLOCK_IOC_SUPERVISOR_DECIDE:
+		return ruleset_ioctl_supervisor_decide(filp, arg);
+	default:
+		return -ENOIOCTLCMD;
+	}
+}
 
 static bool is_initialized(void)
 {
@@ -155,6 +589,7 @@ static const struct file_operations ruleset_fops = {
 	.release = fop_ruleset_release,
 	.read = fop_dummy_read,
 	.write = fop_dummy_write,
+	.unlocked_ioctl = landlock_ruleset_ioctl,
 };
 
 /*
@@ -585,6 +1020,15 @@ SYSCALL_DEFINE2(landlock_restrict_self, const int, ruleset_fd, const __u32,
 	 * was already set, but it is not worth the complexity.
 	 */
 	if (!ruleset)
+		return commit_creds(new_cred);
+
+	/*
+	 * For supervisor-managed rulesets (present in the super table), do not
+	 * enforce anything yet.
+	 */
+	if (new_llcred->domain && new_llcred->domain->super_table &&
+	    landlock_super_table_contains_ruleset(new_llcred->domain->super_table,
+						 ruleset))
 		return commit_creds(new_cred);
 
 	/*

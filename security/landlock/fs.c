@@ -49,6 +49,7 @@
 #include "object.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "supervisor.h"
 
 /* Underlying object management */
 
@@ -1043,6 +1044,7 @@ static int current_check_access_path(const struct path *const path,
 	};
 	const struct landlock_cred_security *const subject =
 		landlock_get_applicable_subject(current_cred(), masks, NULL);
+	const access_mask_t original_access_request = access_request;
 	layer_mask_t layer_masks[LANDLOCK_NUM_ACCESS_FS] = {};
 	struct landlock_request request = {};
 
@@ -1052,13 +1054,33 @@ static int current_check_access_path(const struct path *const path,
 	access_request = landlock_init_layer_masks(subject->domain,
 						   access_request, &layer_masks,
 						   LANDLOCK_KEY_INODE);
-	if (is_access_to_paths_allowed(subject->domain, path, access_request,
-				       &layer_masks, &request, NULL, 0, NULL,
-				       NULL, NULL))
-		return 0;
+	if (!is_access_to_paths_allowed(subject->domain, path, access_request,
+					&layer_masks, &request, NULL, 0, NULL,
+					NULL, NULL)) {
+		landlock_log_denial(subject, &request);
+		return -EACCES;
+	}
 
-	landlock_log_denial(subject, &request);
-	return -EACCES;
+	return landlock_supervisor_check_fs(subject, path, original_access_request);
+}
+
+bool landlock_is_fs_access_allowed(const struct landlock_ruleset *domain,
+				   const struct path *path,
+				   access_mask_t access_request)
+{
+	layer_mask_t layer_masks[LANDLOCK_NUM_ACCESS_FS] = {};
+	struct landlock_request request = {};
+
+	if (!domain)
+		return true;
+	if (!path)
+		return true;
+
+	access_request = landlock_init_layer_masks(domain, access_request,
+					   &layer_masks, LANDLOCK_KEY_INODE);
+	return is_access_to_paths_allowed(domain, path, access_request,
+					 &layer_masks, &request, NULL, 0, NULL, NULL,
+					 NULL);
 }
 
 static __attribute_const__ access_mask_t get_mode_access(const umode_t mode)
@@ -1280,6 +1302,7 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
 	bool allow_parent1, allow_parent2;
 	access_mask_t access_request_parent1, access_request_parent2;
+	access_mask_t supervise_access;
 	struct path mnt_dir;
 	struct dentry *old_parent;
 	layer_mask_t layer_masks_parent1[LANDLOCK_NUM_ACCESS_FS] = {},
@@ -1315,6 +1338,8 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
 
+	supervise_access = access_request_parent1 | access_request_parent2;
+
 	/* The mount points are the same for old and new paths, cf. EXDEV. */
 	if (old_dentry->d_parent == new_dir->dentry) {
 		/*
@@ -1329,7 +1354,8 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 					       access_request_parent1,
 					       &layer_masks_parent1, &request1,
 					       NULL, 0, NULL, NULL, NULL))
-			return 0;
+			return landlock_supervisor_check_fs(subject, new_dir,
+						   supervise_access);
 
 		landlock_log_denial(subject, &request1);
 		return -EACCES;
@@ -1337,6 +1363,7 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 
 	access_request_parent1 |= LANDLOCK_ACCESS_FS_REFER;
 	access_request_parent2 |= LANDLOCK_ACCESS_FS_REFER;
+	supervise_access |= LANDLOCK_ACCESS_FS_REFER;
 
 	/* Saves the common mount point. */
 	mnt_dir.mnt = new_dir->mnt;
@@ -1364,7 +1391,8 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 						&request2.rule_flags);
 
 	if (allow_parent1 && allow_parent2)
-		return 0;
+		return landlock_supervisor_check_fs(subject, new_dir,
+						   supervise_access);
 
 	/*
 	 * To be able to compare source and destination domain access rights,
@@ -1377,7 +1405,8 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 		    &layer_masks_parent1, &request1, old_dentry,
 		    access_request_parent2, &layer_masks_parent2, &request2,
 		    exchange ? new_dentry : NULL))
-		return 0;
+		return landlock_supervisor_check_fs(subject, new_dir,
+						   supervise_access);
 
 	if (request1.access) {
 		request1.audit.u.path.dentry = old_parent;
@@ -1882,7 +1911,8 @@ static int hook_file_open(struct file *const file)
 #endif /* CONFIG_AUDIT */
 
 	if ((open_access_request & allowed_access) == open_access_request)
-		return 0;
+		return landlock_supervisor_check_fs(subject, &file->f_path,
+						   open_access_request);
 
 	/* Sets access to reflect the actual request. */
 	request.access = open_access_request;

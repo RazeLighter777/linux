@@ -27,6 +27,7 @@
 #include "fs.h"
 #include "ruleset.h"
 #include "setup.h"
+#include "supervisor.h"
 #include "task.h"
 
 /**
@@ -374,7 +375,13 @@ static int hook_task_kill(struct task_struct *const p,
 	}
 
 	if (!is_scoped)
-		return 0;
+		goto deny;
+
+	if (landlock_supervisor_check_signal(subject, p, sig))
+		return -EPERM;
+	return 0;
+
+deny:
 
 	landlock_log_denial(subject, &(struct landlock_request) {
 		.type = LANDLOCK_REQUEST_SCOPE_SIGNAL,

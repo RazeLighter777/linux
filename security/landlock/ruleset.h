@@ -21,6 +21,9 @@
 #include "object.h"
 
 struct landlock_hierarchy;
+struct landlock_super_table;
+struct landlock_supervisor_tag;
+struct landlock_supervisor_listener;
 
 /**
  * struct landlock_layer - Access rights for a given layer
@@ -187,6 +190,22 @@ struct landlock_ruleset {
 	 * domain vanishes.  This is needed for the ptrace protection.
 	 */
 	struct landlock_hierarchy *hierarchy;
+	/**
+	 * @super_table: Optional supervisor tag mapping associated with a domain.
+	 */
+	struct landlock_super_table *super_table;
+	/**
+	 * @supervisor_tags: Stored set of tags associated with this ruleset.
+	 */
+	struct landlock_supervisor_tag *supervisor_tags;
+	/**
+	 * @num_supervisor_tags: Number of entries in @supervisor_tags.
+	 */
+	u32 num_supervisor_tags;
+	/**
+	 * @supervisor_listener: Optional event listener for supervision.
+	 */
+	struct landlock_supervisor_listener *supervisor_listener;
 	union {
 		/**
 		 * @work_free: Enables to free a ruleset within a lockless

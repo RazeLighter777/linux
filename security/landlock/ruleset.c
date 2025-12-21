@@ -30,6 +30,23 @@
 #include "limits.h"
 #include "object.h"
 #include "ruleset.h"
+#include "super_table.h"
+#include "supervisor.h"
+#include "tag.h"
+
+static void free_supervisor_tags(struct landlock_ruleset *ruleset)
+{
+	u32 i;
+
+	if (!ruleset->supervisor_tags)
+		return;
+
+	for (i = 0; i < ruleset->num_supervisor_tags; i++)
+		landlock_supervisor_tag_destroy(&ruleset->supervisor_tags[i]);
+	kfree(ruleset->supervisor_tags);
+	ruleset->supervisor_tags = NULL;
+	ruleset->num_supervisor_tags = 0;
+}
 
 static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 {
@@ -458,6 +475,11 @@ static int inherit_ruleset(struct landlock_ruleset *const parent,
 	if (!parent)
 		return 0;
 
+	if (parent->super_table) {
+		landlock_super_table_get(parent->super_table);
+		child->super_table = parent->super_table;
+	}
+
 	/* Locks @child first because we are its only owner. */
 	mutex_lock(&child->lock);
 	mutex_lock_nested(&parent->lock, SINGLE_DEPTH_NESTING);
@@ -510,6 +532,9 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 		free_rule(freeme, LANDLOCK_KEY_NET_PORT);
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+	landlock_supervisor_ruleset_cleanup(ruleset);
+	free_supervisor_tags(ruleset);
+	landlock_super_table_put(ruleset->super_table);
 	landlock_put_hierarchy(ruleset->hierarchy);
 	kfree(ruleset);
 }

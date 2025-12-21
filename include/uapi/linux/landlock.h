@@ -10,6 +10,7 @@
 #ifndef _UAPI_LINUX_LANDLOCK_H
 #define _UAPI_LINUX_LANDLOCK_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
 
 /**
@@ -462,5 +463,111 @@ struct landlock_net_port_attr {
 #define LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET		(1ULL << 0)
 #define LANDLOCK_SCOPE_SIGNAL		                (1ULL << 1)
 /* clang-format on*/
+
+/*
+ * Supervisor extensions (ioctl-based) for associating rulesets to tags.
+ *
+ * NOTE: This is not part of the Landlock syscall ABI versioning.
+ */
+
+enum landlock_supervisor_tag_type {
+	LANDLOCK_SUPERVISOR_TAG_NONE = 0,
+	LANDLOCK_SUPERVISOR_TAG_PIDFD,
+	LANDLOCK_SUPERVISOR_TAG_EXEC_DENTRY,
+};
+
+struct landlock_supervisor_tag_attr {
+	__u32 type;
+	__u32 reserved;
+	union {
+		__s32 pidfd;
+		__s32 exec_fd;
+	};
+};
+
+struct landlock_supervisor_ruleset_tags_attr {
+	__u32 size;
+	__s32 ruleset_fd;
+	__u32 num_tags;
+	__u64 tags;
+};
+
+struct landlock_supervisor_ruleset_swap_attr {
+	__u32 size;
+	__s32 old_ruleset_fd;
+	__s32 new_ruleset_fd;
+	__u32 reserved;
+};
+
+#define LANDLOCK_SUPERVISOR_IOC_MAGIC 'L'
+
+#define LANDLOCK_IOC_SUPERVISOR_SET_TAGS \
+	_IOW(LANDLOCK_SUPERVISOR_IOC_MAGIC, 0x80, \
+	     struct landlock_supervisor_ruleset_tags_attr)
+
+#define LANDLOCK_IOC_SUPERVISOR_SWAP_RULESET \
+	_IOW(LANDLOCK_SUPERVISOR_IOC_MAGIC, 0x81, \
+	     struct landlock_supervisor_ruleset_swap_attr)
+
+/*
+ * Supervisor event interface.
+ *
+ * A supervisor process registers an eventfd on a supervisor ruleset FD.
+ * Each notification increments the eventfd counter by 1.  User space then
+ * fetches pending events with LANDLOCK_IOC_SUPERVISOR_RECV and replies with
+ * LANDLOCK_IOC_SUPERVISOR_DECIDE.
+ */
+
+enum landlock_supervisor_event_type {
+	LANDLOCK_SUPERVISOR_EVENT_FS = 1,
+	LANDLOCK_SUPERVISOR_EVENT_NET,
+	LANDLOCK_SUPERVISOR_EVENT_SIGNAL,
+};
+
+enum landlock_supervisor_decision {
+	LANDLOCK_SUPERVISOR_DECISION_DENY = 0,
+	LANDLOCK_SUPERVISOR_DECISION_ALLOW = 1,
+};
+
+#define LANDLOCK_SUPERVISOR_PATH_MAX 256
+
+struct landlock_supervisor_listen_attr {
+	__u32 size;
+	__s32 event_fd;
+	__u32 flags;
+	__u32 reserved;
+};
+
+struct landlock_supervisor_event {
+	__u32 size;
+	__u32 type;
+	__u32 access;
+	__u32 pid;
+	__u32 tgid;
+	__u32 uid;
+	__u32 reserved;
+	__u64 id;
+	char path[LANDLOCK_SUPERVISOR_PATH_MAX];
+};
+
+struct landlock_supervisor_decide_attr {
+	__u32 size;
+	__u32 decision;
+	__u64 id;
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define LANDLOCK_IOC_SUPERVISOR_LISTEN \
+	_IOW(LANDLOCK_SUPERVISOR_IOC_MAGIC, 0x82, \
+	     struct landlock_supervisor_listen_attr)
+
+#define LANDLOCK_IOC_SUPERVISOR_RECV \
+	_IOWR(LANDLOCK_SUPERVISOR_IOC_MAGIC, 0x83, \
+	      struct landlock_supervisor_event)
+
+#define LANDLOCK_IOC_SUPERVISOR_DECIDE \
+	_IOW(LANDLOCK_SUPERVISOR_IOC_MAGIC, 0x84, \
+	     struct landlock_supervisor_decide_attr)
 
 #endif /* _UAPI_LINUX_LANDLOCK_H */

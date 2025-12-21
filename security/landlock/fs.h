@@ -119,6 +119,10 @@ landlock_inode(const struct inode *const inode)
 	return inode->i_security + landlock_blob_sizes.lbs_inode;
 }
 
+bool landlock_is_fs_access_allowed(const struct landlock_ruleset *domain,
+				   const struct path *path,
+				   access_mask_t access_request);
+
 static inline struct landlock_superblock_security *
 landlock_superblock(const struct super_block *const superblock)
 {
