@@ -42,7 +42,8 @@ static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 	new_ruleset->root_inode = RB_ROOT;
 
 #if IS_ENABLED(CONFIG_INET)
-	new_ruleset->root_net_port = RB_ROOT;
+	mt_init_flags(&new_ruleset->root_net_port, MT_FLAGS_LOCK_EXTERN);
+	mt_set_external_lock(&new_ruleset->root_net_port, &new_ruleset->lock);
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	new_ruleset->num_layers = num_layers;
@@ -145,24 +146,6 @@ create_rule(const struct landlock_id id,
 	return new_rule;
 }
 
-static struct rb_root *get_root(struct landlock_ruleset *const ruleset,
-				const enum landlock_key_type key_type)
-{
-	switch (key_type) {
-	case LANDLOCK_KEY_INODE:
-		return &ruleset->root_inode;
-
-#if IS_ENABLED(CONFIG_INET)
-	case LANDLOCK_KEY_NET_PORT:
-		return &ruleset->root_net_port;
-#endif /* IS_ENABLED(CONFIG_INET) */
-
-	default:
-		WARN_ON_ONCE(1);
-		return ERR_PTR(-EINVAL);
-	}
-}
-
 static void free_rule(struct landlock_rule *const rule,
 		      const enum landlock_key_type key_type)
 {
@@ -185,45 +168,15 @@ static void build_check_ruleset(void)
 	BUILD_BUG_ON(ruleset.num_layers < LANDLOCK_MAX_NUM_LAYERS);
 }
 
-/**
- * insert_rule - Create and insert a rule in a ruleset
- *
- * @ruleset: The ruleset to be updated.
- * @id: The ID to build the new rule with.  The underlying kernel object, if
- *      any, must be held by the caller.
- * @layers: One or multiple layers to be copied into the new rule.
- * @num_layers: The number of @layers entries.
- *
- * When user space requests to add a new rule to a ruleset, @layers only
- * contains one entry and this entry is not assigned to any level.  In this
- * case, the new rule will extend @ruleset, similarly to a boolean OR between
- * access rights.
- *
- * When merging a ruleset in a domain, or copying a domain, @layers will be
- * added to @ruleset as new constraints, similarly to a boolean AND between
- * access rights.
- */
-static int insert_rule(struct landlock_ruleset *const ruleset,
-		       const struct landlock_id id,
-		       const struct landlock_layer (*const layers)[],
-		       const size_t num_layers)
+static int insert_inode_rule(struct landlock_ruleset *const ruleset,
+			     const struct landlock_id id,
+			     const struct landlock_layer (*const layers)[],
+			     const size_t num_layers)
 {
 	struct rb_node **walker_node;
 	struct rb_node *parent_node = NULL;
 	struct landlock_rule *new_rule;
-	struct rb_root *root;
-
-	might_sleep();
-	lockdep_assert_held(&ruleset->lock);
-	if (WARN_ON_ONCE(!layers))
-		return -ENOENT;
-
-	if (is_object_pointer(id.type) && WARN_ON_ONCE(!id.key.object))
-		return -ENOENT;
-
-	root = get_root(ruleset, id.type);
-	if (IS_ERR(root))
-		return PTR_ERR(root);
+	struct rb_root *const root = &ruleset->root_inode;
 
 	walker_node = &root->rb_node;
 	while (*walker_node) {
@@ -286,6 +239,275 @@ static int insert_rule(struct landlock_ruleset *const ruleset,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_INET)
+static int insert_net_port_rule(struct landlock_ruleset *const ruleset,
+				const struct landlock_id id,
+				const struct landlock_layer (*const layers)[],
+				const size_t num_layers)
+{
+	struct landlock_rule *new_rule;
+	struct landlock_rule *this;
+	struct landlock_rule *overlap;
+	struct maple_tree *const root = &ruleset->root_net_port;
+	const u16 port = landlock_net_port_first(id.key.data);
+	const u16 port_last = landlock_net_port_last(id.key.data);
+	const unsigned long first = port;
+	const unsigned long last = port_last;
+	int err;
+	MA_STATE(mas, root, 0, 0);
+
+	if (WARN_ON_ONCE(last < first))
+		return -EINVAL;
+
+	/* Detects overlap and collects the exact existing range (if any). */
+	mas_set_range(&mas, first, first);
+	this = mas_walk(&mas);
+	if (this && (mas.index != first || mas.last != last)) {
+		/*
+		 * For domain merging, allow narrowing an inherited range by splitting
+		 * the existing range and applying the new layer only to the requested
+		 * subrange.
+		 */
+		if ((*layers)[0].level == 0)
+			return -EINVAL;
+		overlap = this;
+		goto split_range;
+	}
+	if (!this) {
+		mas_set_range(&mas, first, first);
+		overlap = mas_find(&mas, last);
+		if (overlap)
+			return -EINVAL;
+	}
+	if (this) {
+		/* Only a single-level layer should match an existing rule. */
+		if (WARN_ON_ONCE(num_layers != 1))
+			return -EINVAL;
+
+		/* If there is a matching rule, updates it. */
+		if ((*layers)[0].level == 0) {
+			/*
+			 * Extends access rights when the request comes from
+			 * landlock_add_rule(2), i.e. @ruleset is not a domain.
+			 */
+			if (WARN_ON_ONCE(this->num_layers != 1))
+				return -EINVAL;
+			if (WARN_ON_ONCE(this->layers[0].level != 0))
+				return -EINVAL;
+			this->layers[0].access |= (*layers)[0].access;
+			return 0;
+		}
+
+		if (WARN_ON_ONCE(this->layers[0].level == 0))
+			return -EINVAL;
+
+		/*
+		 * Intersects access rights when it is a merge between a
+		 * ruleset and a domain.
+		 */
+		new_rule = create_rule(id, &this->layers, this->num_layers,
+				       &(*layers)[0]);
+		if (IS_ERR(new_rule))
+			return PTR_ERR(new_rule);
+		mas_set_range(&mas, first, last);
+		err = mas_store_gfp(&mas, new_rule, GFP_KERNEL_ACCOUNT);
+		if (err) {
+			free_rule(new_rule, id.type);
+			return err;
+		}
+		free_rule(this, id.type);
+		return 0;
+	}
+
+	/* There is no match for @id. */
+	build_check_ruleset();
+	if (ruleset->num_rules >= LANDLOCK_MAX_NUM_RULES)
+		return -E2BIG;
+	new_rule = create_rule(id, layers, num_layers, NULL);
+	if (IS_ERR(new_rule))
+		return PTR_ERR(new_rule);
+	mas_set_range(&mas, first, last);
+	err = mas_store_gfp(&mas, new_rule, GFP_KERNEL_ACCOUNT);
+	if (err) {
+		free_rule(new_rule, id.type);
+		return err;
+	}
+	ruleset->num_rules++;
+	return 0;
+
+split_range:
+	/* Only allow narrowing inside a single existing range. */
+	if (mas.index > first || mas.last < last)
+		return -EINVAL;
+	/* Only a single-level layer should be inserted. */
+	if (WARN_ON_ONCE(num_layers != 1))
+		return -EINVAL;
+
+	/* Account for the potential extra left/right fragments. */
+	{
+		u32 extra = 0;
+		if (mas.index < first)
+			extra++;
+		if (last < mas.last)
+			extra++;
+		build_check_ruleset();
+		if (ruleset->num_rules + extra > LANDLOCK_MAX_NUM_RULES)
+			return -E2BIG;
+	}
+
+	{
+		const unsigned long o_first = mas.index;
+		const unsigned long o_last = mas.last;
+		struct landlock_rule *left_rule = NULL;
+		struct landlock_rule *mid_rule;
+		struct landlock_rule *right_rule = NULL;
+		struct landlock_id id_mid = {
+			.key.data = landlock_net_port_make((u16)first, (u16)last),
+			.type = LANDLOCK_KEY_NET_PORT,
+		};
+		struct ma_state erase_mas;
+
+		if (o_first < first) {
+			struct landlock_id id_left = {
+				.key.data = landlock_net_port_make((u16)o_first,
+							 (u16)(first - 1)),
+				.type = LANDLOCK_KEY_NET_PORT,
+			};
+			left_rule = create_rule(id_left, &overlap->layers,
+						overlap->num_layers, NULL);
+			if (IS_ERR(left_rule))
+				return PTR_ERR(left_rule);
+		}
+
+		mid_rule = create_rule(id_mid, &overlap->layers, overlap->num_layers,
+				      &(*layers)[0]);
+		if (IS_ERR(mid_rule)) {
+			free_rule(left_rule, id.type);
+			return PTR_ERR(mid_rule);
+		}
+
+		if (last < o_last) {
+			struct landlock_id id_right = {
+				.key.data = landlock_net_port_make((u16)(last + 1),
+							 (u16)o_last),
+				.type = LANDLOCK_KEY_NET_PORT,
+			};
+			right_rule = create_rule(id_right, &overlap->layers,
+						 overlap->num_layers, NULL);
+			if (IS_ERR(right_rule)) {
+				free_rule(mid_rule, id.type);
+				free_rule(left_rule, id.type);
+				return PTR_ERR(right_rule);
+			}
+		}
+
+		/* Remove the original overlapped range. */
+		mas_init(&erase_mas, root, first);
+		mas_erase(&erase_mas);
+
+		/* Store left/middle/right without overlaps. */
+		if (left_rule) {
+			mas_set_range(&mas, o_first, first - 1);
+			err = mas_store_gfp(&mas, left_rule, GFP_KERNEL_ACCOUNT);
+			if (err)
+				goto split_restore;
+		}
+
+		mas_set_range(&mas, first, last);
+		err = mas_store_gfp(&mas, mid_rule, GFP_KERNEL_ACCOUNT);
+		if (err)
+			goto split_restore;
+
+		if (right_rule) {
+			mas_set_range(&mas, last + 1, o_last);
+			err = mas_store_gfp(&mas, right_rule, GFP_KERNEL_ACCOUNT);
+			if (err)
+				goto split_restore;
+		}
+
+		/* Adjust rule count and free the replaced rule. */
+		if (o_first < first)
+			ruleset->num_rules++;
+		if (last < o_last)
+			ruleset->num_rules++;
+		free_rule(overlap, id.type);
+		return 0;
+
+split_restore:
+		/* Best-effort restore original entry if a store fails. */
+		{
+			struct ma_state tmp;
+
+			/* Erase any fragment(s) we might have stored. */
+			if (left_rule) {
+				mas_init(&tmp, root, o_first);
+				mas_erase(&tmp);
+			}
+			mas_init(&tmp, root, first);
+			mas_erase(&tmp);
+			if (right_rule) {
+				mas_init(&tmp, root, last + 1);
+				mas_erase(&tmp);
+			}
+
+			mas_set_range(&mas, o_first, o_last);
+			if (mas_store_gfp(&mas, overlap, GFP_KERNEL_ACCOUNT))
+				free_rule(overlap, id.type);
+		}
+		free_rule(left_rule, id.type);
+		free_rule(mid_rule, id.type);
+		free_rule(right_rule, id.type);
+		return err;
+	}
+}
+#endif /* IS_ENABLED(CONFIG_INET) */
+
+/**
+ * insert_rule - Create and insert a rule in a ruleset
+ *
+ * @ruleset: The ruleset to be updated.
+ * @id: The ID to build the new rule with.  The underlying kernel object, if
+ *      any, must be held by the caller.
+ * @layers: One or multiple layers to be copied into the new rule.
+ * @num_layers: The number of @layers entries.
+ *
+ * When user space requests to add a new rule to a ruleset, @layers only
+ * contains one entry and this entry is not assigned to any level.  In this
+ * case, the new rule will extend @ruleset, similarly to a boolean OR between
+ * access rights.
+ *
+ * When merging a ruleset in a domain, or copying a domain, @layers will be
+ * added to @ruleset as new constraints, similarly to a boolean AND between
+ * access rights.
+ */
+static int insert_rule(struct landlock_ruleset *const ruleset,
+		       const struct landlock_id id,
+		       const struct landlock_layer (*const layers)[],
+		       const size_t num_layers)
+{
+	might_sleep();
+	lockdep_assert_held(&ruleset->lock);
+	if (WARN_ON_ONCE(!layers))
+		return -ENOENT;
+
+	if (is_object_pointer(id.type) && WARN_ON_ONCE(!id.key.object))
+		return -ENOENT;
+
+	switch (id.type) {
+	case LANDLOCK_KEY_INODE:
+		return insert_inode_rule(ruleset, id, layers, num_layers);
+
+#if IS_ENABLED(CONFIG_INET)
+	case LANDLOCK_KEY_NET_PORT:
+		return insert_net_port_rule(ruleset, id, layers, num_layers);
+#endif /* IS_ENABLED(CONFIG_INET) */
+
+	default:
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+}
+
 static void build_check_layer(void)
 {
 	const struct landlock_layer layer = {
@@ -320,42 +542,79 @@ static int merge_tree(struct landlock_ruleset *const dst,
 		      struct landlock_ruleset *const src,
 		      const enum landlock_key_type key_type)
 {
-	struct landlock_rule *walker_rule, *next_rule;
-	struct rb_root *src_root;
 	int err = 0;
 
 	might_sleep();
 	lockdep_assert_held(&dst->lock);
 	lockdep_assert_held(&src->lock);
 
-	src_root = get_root(src, key_type);
-	if (IS_ERR(src_root))
-		return PTR_ERR(src_root);
+	switch (key_type) {
+	case LANDLOCK_KEY_INODE: {
+		struct landlock_rule *walker_rule, *next_rule;
+		struct rb_root *const src_root = &src->root_inode;
 
-	/* Merges the @src tree. */
-	rbtree_postorder_for_each_entry_safe(walker_rule, next_rule, src_root,
-					     node) {
-		struct landlock_layer layers[] = { {
-			.level = dst->num_layers,
-		} };
-		const struct landlock_id id = {
-			.key = walker_rule->key,
-			.type = key_type,
-		};
+		/* Merges the @src inode tree. */
+		rbtree_postorder_for_each_entry_safe(walker_rule, next_rule,
+					     src_root, node) {
+			struct landlock_layer layers[] = { {
+				.level = dst->num_layers,
+			} };
+			const struct landlock_id id = {
+				.key = walker_rule->key,
+				.type = key_type,
+			};
 
-		if (WARN_ON_ONCE(walker_rule->num_layers != 1))
-			return -EINVAL;
+			if (WARN_ON_ONCE(walker_rule->num_layers != 1))
+				return -EINVAL;
 
-		if (WARN_ON_ONCE(walker_rule->layers[0].level != 0))
-			return -EINVAL;
+			if (WARN_ON_ONCE(walker_rule->layers[0].level != 0))
+				return -EINVAL;
 
-		layers[0].access = walker_rule->layers[0].access;
+			layers[0].access = walker_rule->layers[0].access;
 
-		err = insert_rule(dst, id, &layers, ARRAY_SIZE(layers));
-		if (err)
-			return err;
+			err = insert_rule(dst, id, &layers, ARRAY_SIZE(layers));
+			if (err)
+				return err;
+		}
+		return 0;
 	}
-	return err;
+
+#if IS_ENABLED(CONFIG_INET)
+	case LANDLOCK_KEY_NET_PORT: {
+		struct landlock_rule *walker_rule;
+		MA_STATE(mas, &src->root_net_port, 0, 0);
+
+		/* Merges the @src network port tree. */
+		mas_for_each(&mas, walker_rule, ULONG_MAX) {
+			struct landlock_layer layers[] = { {
+				.level = dst->num_layers,
+			} };
+			const struct landlock_id id = {
+				.key.data = landlock_net_port_make((u16)mas.index,
+							 (u16)mas.last),
+				.type = key_type,
+			};
+
+			if (WARN_ON_ONCE(walker_rule->num_layers != 1))
+				return -EINVAL;
+
+			if (WARN_ON_ONCE(walker_rule->layers[0].level != 0))
+				return -EINVAL;
+
+			layers[0].access = walker_rule->layers[0].access;
+
+			err = insert_rule(dst, id, &layers, ARRAY_SIZE(layers));
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+#endif /* IS_ENABLED(CONFIG_INET) */
+
+	default:
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
 }
 
 static int merge_ruleset(struct landlock_ruleset *const dst,
@@ -405,32 +664,59 @@ static int inherit_tree(struct landlock_ruleset *const parent,
 			struct landlock_ruleset *const child,
 			const enum landlock_key_type key_type)
 {
-	struct landlock_rule *walker_rule, *next_rule;
-	struct rb_root *parent_root;
 	int err = 0;
 
 	might_sleep();
 	lockdep_assert_held(&parent->lock);
 	lockdep_assert_held(&child->lock);
 
-	parent_root = get_root(parent, key_type);
-	if (IS_ERR(parent_root))
-		return PTR_ERR(parent_root);
+	switch (key_type) {
+	case LANDLOCK_KEY_INODE: {
+		struct landlock_rule *walker_rule, *next_rule;
+		struct rb_root *const parent_root = &parent->root_inode;
 
-	/* Copies the @parent inode or network tree. */
-	rbtree_postorder_for_each_entry_safe(walker_rule, next_rule,
+		/* Copies the @parent inode tree. */
+		rbtree_postorder_for_each_entry_safe(walker_rule, next_rule,
 					     parent_root, node) {
-		const struct landlock_id id = {
-			.key = walker_rule->key,
-			.type = key_type,
-		};
+			const struct landlock_id id = {
+				.key = walker_rule->key,
+				.type = key_type,
+			};
 
-		err = insert_rule(child, id, &walker_rule->layers,
-				  walker_rule->num_layers);
-		if (err)
-			return err;
+			err = insert_rule(child, id, &walker_rule->layers,
+					  walker_rule->num_layers);
+			if (err)
+				return err;
+		}
+		return 0;
 	}
-	return err;
+
+#if IS_ENABLED(CONFIG_INET)
+	case LANDLOCK_KEY_NET_PORT: {
+		struct landlock_rule *walker_rule;
+		MA_STATE(mas, &parent->root_net_port, 0, 0);
+
+		/* Copies the @parent network port tree. */
+		mas_for_each(&mas, walker_rule, ULONG_MAX) {
+			const struct landlock_id id = {
+				.key.data = landlock_net_port_make((u16)mas.index,
+							 (u16)mas.last),
+				.type = key_type,
+			};
+
+			err = insert_rule(child, id, &walker_rule->layers,
+					  walker_rule->num_layers);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+#endif /* IS_ENABLED(CONFIG_INET) */
+
+	default:
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
 }
 
 static int inherit_ruleset(struct landlock_ruleset *const parent,
@@ -489,9 +775,26 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 		free_rule(freeme, LANDLOCK_KEY_INODE);
 
 #if IS_ENABLED(CONFIG_INET)
-	rbtree_postorder_for_each_entry_safe(freeme, next,
-					     &ruleset->root_net_port, node)
-		free_rule(freeme, LANDLOCK_KEY_NET_PORT);
+	{
+		MA_STATE(mas, &ruleset->root_net_port, 0, 0);
+
+		/*
+		 * ruleset->root_net_port uses MT_FLAGS_LOCK_EXTERN, which normally
+		 * requires holding ruleset->lock for maple tree operations.
+		 *
+		 * Here, the refcount already reached zero and we are tearing down the
+		 * ruleset, potentially from a workqueue context.  Avoid taking
+		 * ruleset->lock (which may invert lock ordering with workqueue
+		 * internals) and bypass lockdep checks instead.
+		 */
+#ifdef CONFIG_LOCKDEP
+		ruleset->root_net_port.ma_external_lock = NULL;
+#endif
+
+		mas_for_each(&mas, freeme, ULONG_MAX)
+			free_rule(freeme, LANDLOCK_KEY_NET_PORT);
+		__mt_destroy(&ruleset->root_net_port);
+	}
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	landlock_put_hierarchy(ruleset->hierarchy);
@@ -590,26 +893,34 @@ const struct landlock_rule *
 landlock_find_rule(const struct landlock_ruleset *const ruleset,
 		   const struct landlock_id id)
 {
-	const struct rb_root *root;
-	const struct rb_node *node;
+	switch (id.type) {
+	case LANDLOCK_KEY_INODE: {
+		const struct rb_node *node = ruleset->root_inode.rb_node;
 
-	root = get_root((struct landlock_ruleset *)ruleset, id.type);
-	if (IS_ERR(root))
+		while (node) {
+			struct landlock_rule *this =
+				rb_entry(node, struct landlock_rule, node);
+
+			if (this->key.data == id.key.data)
+				return this;
+			if (this->key.data < id.key.data)
+				node = node->rb_right;
+			else
+				node = node->rb_left;
+		}
 		return NULL;
-	node = root->rb_node;
-
-	while (node) {
-		struct landlock_rule *this =
-			rb_entry(node, struct landlock_rule, node);
-
-		if (this->key.data == id.key.data)
-			return this;
-		if (this->key.data < id.key.data)
-			node = node->rb_right;
-		else
-			node = node->rb_left;
 	}
-	return NULL;
+
+#if IS_ENABLED(CONFIG_INET)
+	case LANDLOCK_KEY_NET_PORT:
+		return mtree_load((struct maple_tree *)&ruleset->root_net_port,
+				  (unsigned long)landlock_net_port_first(id.key.data));
+#endif /* IS_ENABLED(CONFIG_INET) */
+
+	default:
+		WARN_ON_ONCE(1);
+		return NULL;
+	}
 }
 
 /*

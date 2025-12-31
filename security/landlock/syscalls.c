@@ -161,7 +161,7 @@ static const struct file_operations ruleset_fops = {
  * Documentation/userspace-api/landlock.rst should be updated to reflect the
  * UAPI change.
  */
-const int landlock_abi_version = 7;
+const int landlock_abi_version = 8;
 
 /**
  * sys_landlock_create_ruleset - Create a new ruleset
@@ -353,6 +353,8 @@ static int add_rule_net_port(struct landlock_ruleset *ruleset,
 			     const void __user *const rule_attr)
 {
 	struct landlock_net_port_attr net_port_attr;
+	u16 port, port_last;
+	bool uses_range;
 	int res;
 	access_mask_t mask;
 
@@ -373,12 +375,37 @@ static int add_rule_net_port(struct landlock_ruleset *ruleset,
 	if ((net_port_attr.allowed_access | mask) != mask)
 		return -EINVAL;
 
+	if (net_port_attr.port_range.__reserved)
+		return -EINVAL;
+
+	port = net_port_attr.port_range.port;
+	port_last = net_port_attr.port_range.port_last;
+	if (!port_last)
+		port_last = port;
+	uses_range = (port_last != port);
+
+	/*
+	 * Port ranges are a user-visible extension and must be explicitly handled
+	 * by the ruleset for backward compatibility.
+	 */
+	if (uses_range) {
+		if ((net_port_attr.allowed_access & LANDLOCK_ACCESS_NET_BIND_TCP) &&
+		    !(mask & LANDLOCK_ACCESS_NET_BIND_TCP_RANGE))
+			return -EINVAL;
+		if ((net_port_attr.allowed_access & LANDLOCK_ACCESS_NET_CONNECT_TCP) &&
+		    !(mask & LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE))
+			return -EINVAL;
+	}
+
+	if (port_last < port)
+		return -EINVAL;
+
 	/* Denies inserting a rule with port greater than 65535. */
-	if (net_port_attr.port > U16_MAX)
+	if (port > U16_MAX || port_last > U16_MAX)
 		return -EINVAL;
 
 	/* Imports the new rule. */
-	return landlock_append_net_rule(ruleset, net_port_attr.port,
+	return landlock_append_net_rule(ruleset, port, port_last,
 					net_port_attr.allowed_access);
 }
 

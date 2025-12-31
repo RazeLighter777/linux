@@ -950,6 +950,8 @@ TEST_F(protocol, connect_unspec)
 	EXPECT_EQ(0, close(bind_fd));
 }
 
+
+
 FIXTURE(ipv4)
 {
 	struct service_fixture srv0, srv1;
@@ -1326,11 +1328,13 @@ FIXTURE_TEARDOWN(mini)
 
 /* clang-format off */
 
-#define ACCESS_LAST LANDLOCK_ACCESS_NET_CONNECT_TCP
+#define ACCESS_LAST LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE
 
 #define ACCESS_ALL ( \
 	LANDLOCK_ACCESS_NET_BIND_TCP | \
-	LANDLOCK_ACCESS_NET_CONNECT_TCP)
+	LANDLOCK_ACCESS_NET_CONNECT_TCP | \
+	LANDLOCK_ACCESS_NET_BIND_TCP_RANGE | \
+	LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE)
 
 /* clang-format on */
 
@@ -1475,81 +1479,165 @@ TEST_F(mini, inval)
 				       &tcp_bind, 0));
 }
 
-TEST_F(mini, tcp_port_overflow)
+TEST_F(mini, net_port_range_invalid)
 {
 	const struct landlock_ruleset_attr ruleset_attr = {
-		.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
-				      LANDLOCK_ACCESS_NET_CONNECT_TCP,
+		.handled_access_net = ACCESS_ALL,
 	};
-	const struct landlock_net_port_attr port_max_bind = {
+	struct landlock_net_port_attr net_port = {
 		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
-		.port = UINT16_MAX,
+		.port_range = {
+			.port = 2000,
+			.port_last = 1999,
+		},
 	};
-	const struct landlock_net_port_attr port_max_connect = {
-		.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
-		.port = UINT16_MAX,
-	};
-	const struct landlock_net_port_attr port_overflow1 = {
-		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
-		.port = UINT16_MAX + 1,
-	};
-	const struct landlock_net_port_attr port_overflow2 = {
-		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
-		.port = UINT16_MAX + 2,
-	};
-	const struct landlock_net_port_attr port_overflow3 = {
-		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
-		.port = UINT32_MAX + 1UL,
-	};
-	const struct landlock_net_port_attr port_overflow4 = {
-		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
-		.port = UINT32_MAX + 2UL,
-	};
-	const struct protocol_variant ipv4_tcp = {
-		.domain = AF_INET,
-		.type = SOCK_STREAM,
-	};
-	struct service_fixture srv_denied, srv_max_allowed;
 	int ruleset_fd;
 
-	ASSERT_EQ(0, set_service(&srv_denied, ipv4_tcp, 0));
+	ruleset_fd =
+		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
+	ASSERT_LE(0, ruleset_fd);
 
-	/* Be careful to avoid port inconsistencies. */
-	srv_max_allowed = srv_denied;
-	srv_max_allowed.port = port_max_bind.port;
-	srv_max_allowed.ipv4_addr.sin_port = htons(port_max_bind.port);
+	EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+				&net_port, 0));
+	EXPECT_EQ(EINVAL, errno);
+
+	EXPECT_EQ(0, close(ruleset_fd));
+}
+
+TEST_F(mini, net_port_range_requires_handled_flag)
+{
+	struct landlock_net_port_attr range_bind = {
+		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+		.port_range = {
+			.port = 13000,
+			.port_last = 13010,
+		},
+	};
+	struct landlock_net_port_attr range_connect = {
+		.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+		.port_range = {
+			.port = 13000,
+			.port_last = 13010,
+		},
+	};
+	int ruleset_fd;
+
+	/* Range is rejected if the ruleset doesn't explicitly handle range. */
+	{
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP,
+		};
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					&range_bind, 0));
+		EXPECT_EQ(EINVAL, errno);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* Range is accepted once the ruleset handles the corresponding range bit. */
+	{
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
+					      LANDLOCK_ACCESS_NET_BIND_TCP_RANGE,
+		};
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		EXPECT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					      &range_bind, 0));
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* Connect range: same opt-in behavior. */
+	{
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+		};
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					&range_connect, 0));
+		EXPECT_EQ(EINVAL, errno);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	{
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP |
+					      LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE,
+		};
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		EXPECT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					      &range_connect, 0));
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+}
+
+TEST_F(mini, net_port_range_overlap_and_adjacent)
+{
+	const struct landlock_ruleset_attr ruleset_attr = {
+		.handled_access_net = ACCESS_ALL,
+	};
+	struct landlock_net_port_attr net_port = {
+		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+		.port_range = {
+			.port = 12000,
+			.port_last = 12010,
+		},
+	};
+	struct landlock_net_port_attr overlap = {
+		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+		.port_range = {
+			.port = 12005,
+			.port_last = 12015,
+		},
+	};
+	struct landlock_net_port_attr touch_endpoint = {
+		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+		.port_range = {
+			.port = 12010,
+			.port_last = 12020,
+		},
+	};
+	struct landlock_net_port_attr adjacent = {
+		.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+		.port_range = {
+			.port = 12011,
+			.port_last = 12020,
+		},
+	};
+	int ruleset_fd;
 
 	ruleset_fd =
 		landlock_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
 	ASSERT_LE(0, ruleset_fd);
 
 	ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-				       &port_max_bind, 0));
+			       &net_port, 0));
 
+	/* Any overlap (including inclusive endpoint overlap) is rejected. */
 	EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-					&port_overflow1, 0));
+				&overlap, 0));
 	EXPECT_EQ(EINVAL, errno);
 
 	EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-					&port_overflow2, 0));
+				&touch_endpoint, 0));
 	EXPECT_EQ(EINVAL, errno);
 
-	EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-					&port_overflow3, 0));
-	EXPECT_EQ(EINVAL, errno);
+	/* Adjacent, non-overlapping range is accepted. */
+	EXPECT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+			       &adjacent, 0));
 
-	/* Interleaves with invalid rule additions. */
-	ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-				       &port_max_connect, 0));
-
-	EXPECT_EQ(-1, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
-					&port_overflow4, 0));
-	EXPECT_EQ(EINVAL, errno);
-
-	enforce_ruleset(_metadata, ruleset_fd);
-
-	test_bind_and_connect(_metadata, &srv_denied, true, true);
-	test_bind_and_connect(_metadata, &srv_max_allowed, false, false);
+	EXPECT_EQ(0, close(ruleset_fd));
 }
 
 FIXTURE(ipv4_tcp)
@@ -1737,6 +1825,400 @@ FIXTURE_SETUP(port_specific)
 
 FIXTURE_TEARDOWN(port_specific)
 {
+}
+
+TEST_F(port_specific, connect_port_range_inclusive)
+{
+	const uint16_t base_port = self->srv0.port;
+	const uint16_t allowed_last = base_port + 2;
+	const uint16_t denied_port = base_port + 3;
+	struct service_fixture srv;
+	int srv_fd[4] = { -1, -1, -1, -1 };
+	int i;
+
+	/* Prepare 4 listening sockets before applying Landlock. */
+	for (i = 0; i < 4; i++) {
+		srv = self->srv0;
+		set_port(&srv, base_port + i);
+		srv_fd[i] = socket_variant(&srv);
+		ASSERT_LE(0, srv_fd[i]);
+		ASSERT_EQ(0, bind_variant(srv_fd[i], &srv));
+		ASSERT_EQ(0, listen(srv_fd[i], backlog));
+	}
+
+	if (variant->sandbox == TCP_SANDBOX) {
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP |
+					      LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE,
+		};
+		struct landlock_net_port_attr allow_range = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port,
+				.port_last = allowed_last,
+			},
+		};
+		int ruleset_fd;
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* Connect attempts: inclusive range is allowed; outside is denied. */
+	for (i = 0; i < 4; i++) {
+		int client_fd, ret;
+		uint16_t port = base_port + i;
+
+		srv = self->srv0;
+		set_port(&srv, port);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+
+		if (variant->sandbox == TCP_SANDBOX && port == denied_port) {
+			EXPECT_EQ(-EACCES, ret);
+		} else {
+			EXPECT_EQ(0, ret);
+		}
+		EXPECT_EQ(0, close(client_fd));
+	}
+
+	for (i = 0; i < 4; i++)
+		EXPECT_EQ(0, close(srv_fd[i]));
+}
+
+TEST_F(port_specific, bind_port_range_inclusive)
+{
+	const uint16_t base_port = self->srv0.port;
+	const uint16_t allowed_last = base_port + 2;
+	const uint16_t denied_port = base_port + 3;
+	struct service_fixture srv;
+	int sock_fd, ret;
+
+	if (variant->sandbox == TCP_SANDBOX) {
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
+					      LANDLOCK_ACCESS_NET_BIND_TCP_RANGE,
+		};
+		struct landlock_net_port_attr allow_range = {
+			.allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+			.port_range = {
+				.port = base_port,
+				.port_last = allowed_last,
+			},
+		};
+		int ruleset_fd;
+
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* Bind on first allowed port. */
+	srv = self->srv0;
+	set_port(&srv, base_port);
+	sock_fd = socket_variant(&srv);
+	ASSERT_LE(0, sock_fd);
+	ret = bind_variant(sock_fd, &srv);
+	EXPECT_EQ(0, ret);
+	EXPECT_EQ(0, close(sock_fd));
+
+	/* Bind on last allowed port (inclusive). */
+	srv = self->srv0;
+	set_port(&srv, allowed_last);
+	sock_fd = socket_variant(&srv);
+	ASSERT_LE(0, sock_fd);
+	ret = bind_variant(sock_fd, &srv);
+	EXPECT_EQ(0, ret);
+	EXPECT_EQ(0, close(sock_fd));
+
+	/* Bind just outside the allowed range. */
+	srv = self->srv0;
+	set_port(&srv, denied_port);
+	sock_fd = socket_variant(&srv);
+	ASSERT_LE(0, sock_fd);
+	ret = bind_variant(sock_fd, &srv);
+	if (variant->sandbox == TCP_SANDBOX) {
+		EXPECT_EQ(-EACCES, ret);
+	}
+	else {
+		EXPECT_EQ(0, ret);
+	}
+	EXPECT_EQ(0, close(sock_fd));
+}
+
+TEST_F(port_specific, connect_port_range_two_layers_narrow_second)
+{
+	const uint16_t base_port = self->srv0.port;
+	struct service_fixture srv;
+	int srv_fd[4] = { -1, -1, -1, -1 };
+	int i;
+
+	/* Prepare 4 listening sockets before applying Landlock. */
+	for (i = 0; i < 4; i++) {
+		srv = self->srv0;
+		set_port(&srv, base_port + i);
+		srv_fd[i] = socket_variant(&srv);
+		ASSERT_LE(0, srv_fd[i]);
+		ASSERT_EQ(0, bind_variant(srv_fd[i], &srv));
+		ASSERT_EQ(0, listen(srv_fd[i], backlog));
+	}
+
+	if (variant->sandbox == TCP_SANDBOX) {
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP |
+					      LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE,
+		};
+		struct landlock_net_port_attr allow_range_1 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port,
+				.port_last = base_port + 3,
+			},
+		};
+		struct landlock_net_port_attr allow_range_2 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port + 1,
+				.port_last = base_port + 2,
+			},
+		};
+		int ruleset_fd;
+
+		/* First layer: wider range. */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_1, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+
+		/* Second layer: subset (narrower). */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_2, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/*
+	 * Effective access is the intersection of both layers:
+	 * only base+1 and base+2 should be allowed.
+	 */
+	for (i = 0; i < 4; i++) {
+		int client_fd, ret;
+		uint16_t port = base_port + i;
+		bool should_deny;
+
+		srv = self->srv0;
+		set_port(&srv, port);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+
+		should_deny = (variant->sandbox == TCP_SANDBOX) &&
+			     (port == base_port || port == base_port + 3);
+		if (should_deny) {
+			EXPECT_EQ(-EACCES, ret);
+		} else {
+			EXPECT_EQ(0, ret);
+		}
+		EXPECT_EQ(0, close(client_fd));
+	}
+
+	for (i = 0; i < 4; i++)
+		EXPECT_EQ(0, close(srv_fd[i]));
+}
+
+TEST_F(port_specific, connect_port_range_two_layers_intersect_expand_fails)
+{
+	const uint16_t base_port = self->srv0.port;
+	struct service_fixture srv;
+	int srv_fd[5] = { -1, -1, -1, -1, -1 };
+	int i;
+
+	/* Prepare 5 listening sockets before applying Landlock. */
+	for (i = 0; i < 5; i++) {
+		srv = self->srv0;
+		set_port(&srv, base_port + i);
+		srv_fd[i] = socket_variant(&srv);
+		ASSERT_LE(0, srv_fd[i]);
+		ASSERT_EQ(0, bind_variant(srv_fd[i], &srv));
+		ASSERT_EQ(0, listen(srv_fd[i], backlog));
+	}
+
+	if (variant->sandbox == TCP_SANDBOX) {
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP |
+					      LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE,
+		};
+		struct landlock_net_port_attr allow_range_1 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port,
+				.port_last = base_port + 2,
+			},
+		};
+		struct landlock_net_port_attr allow_range_2 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port + 2,
+				.port_last = base_port + 4,
+			},
+		};
+		int ruleset_fd;
+
+		/* First layer: base..base+2 */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_1, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+
+		/*
+		 * Second layer intersects but includes more ports than the first.
+		 * This should fail.
+		 */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_2, 0));
+		ASSERT_EQ(0, prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+		EXPECT_EQ(-1, landlock_restrict_self(ruleset_fd, 0));
+		EXPECT_EQ(EINVAL, errno);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* After the failed second layer, the first layer still applies. */
+	{
+		int client_fd, ret;
+
+		srv = self->srv0;
+		set_port(&srv, base_port);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+		EXPECT_EQ(0, ret);
+		EXPECT_EQ(0, close(client_fd));
+
+		srv = self->srv0;
+		set_port(&srv, base_port + 4);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+		if (variant->sandbox == TCP_SANDBOX) {
+			EXPECT_EQ(-EACCES, ret);
+		} else {
+			EXPECT_EQ(0, ret);
+		}
+		EXPECT_EQ(0, close(client_fd));
+	}
+
+	for (i = 0; i < 5; i++)
+		EXPECT_EQ(0, close(srv_fd[i]));
+}
+
+TEST_F(port_specific, connect_port_range_two_layers_superset_fails)
+{
+	const uint16_t base_port = self->srv0.port;
+	struct service_fixture srv;
+	int srv_fd[4] = { -1, -1, -1, -1 };
+	int i;
+
+	/* Prepare 4 listening sockets before applying Landlock. */
+	for (i = 0; i < 4; i++) {
+		srv = self->srv0;
+		set_port(&srv, base_port + i);
+		srv_fd[i] = socket_variant(&srv);
+		ASSERT_LE(0, srv_fd[i]);
+		ASSERT_EQ(0, bind_variant(srv_fd[i], &srv));
+		ASSERT_EQ(0, listen(srv_fd[i], backlog));
+	}
+
+	if (variant->sandbox == TCP_SANDBOX) {
+		const struct landlock_ruleset_attr ruleset_attr = {
+			.handled_access_net = LANDLOCK_ACCESS_NET_CONNECT_TCP |
+					      LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE,
+		};
+		struct landlock_net_port_attr allow_range_1 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port + 1,
+				.port_last = base_port + 2,
+			},
+		};
+		struct landlock_net_port_attr allow_range_2 = {
+			.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP,
+			.port_range = {
+				.port = base_port,
+				.port_last = base_port + 3,
+			},
+		};
+		int ruleset_fd;
+
+		/* First layer: base+1..base+2 */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_1, 0));
+		enforce_ruleset(_metadata, ruleset_fd);
+		EXPECT_EQ(0, close(ruleset_fd));
+
+		/* Second layer is a superset of the first; should fail. */
+		ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+					     sizeof(ruleset_attr), 0);
+		ASSERT_LE(0, ruleset_fd);
+		ASSERT_EQ(0, landlock_add_rule(ruleset_fd, LANDLOCK_RULE_NET_PORT,
+					       &allow_range_2, 0));
+		ASSERT_EQ(0, prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+		EXPECT_EQ(-1, landlock_restrict_self(ruleset_fd, 0));
+		EXPECT_EQ(EINVAL, errno);
+		EXPECT_EQ(0, close(ruleset_fd));
+	}
+
+	/* After the failed second layer, the first layer still applies. */
+	{
+		int client_fd, ret;
+
+		srv = self->srv0;
+		set_port(&srv, base_port);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+		if (variant->sandbox == TCP_SANDBOX) {
+			EXPECT_EQ(-EACCES, ret);
+		} else {
+			EXPECT_EQ(0, ret);
+		}
+		EXPECT_EQ(0, close(client_fd));
+
+		srv = self->srv0;
+		set_port(&srv, base_port + 1);
+		client_fd = socket_variant(&srv);
+		ASSERT_LE(0, client_fd);
+		ret = connect_variant(client_fd, &srv);
+		EXPECT_EQ(0, ret);
+		EXPECT_EQ(0, close(client_fd));
+	}
+
+	for (i = 0; i < 4; i++)
+		EXPECT_EQ(0, close(srv_fd[i]));
 }
 
 TEST_F(port_specific, bind_connect_zero)

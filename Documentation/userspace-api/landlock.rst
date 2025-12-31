@@ -8,7 +8,7 @@ Landlock: unprivileged access control
 =====================================
 
 :Author: Mickaël Salaün
-:Date: March 2025
+:Date: December 2025
 
 The goal of Landlock is to enable restriction of ambient rights (e.g. global
 filesystem or network access) for a set of processes.  Because Landlock
@@ -43,6 +43,8 @@ Filesystem rules
 Network rules (since ABI v4)
     For these rules, the object is a TCP port,
     and the related actions are defined with `network access rights`.
+
+    Port ranges can be specified since ABI v8.
 
 Defining and enforcing a security policy
 ----------------------------------------
@@ -127,6 +129,17 @@ version, and only use the available subset of access rights:
         /* Removes LANDLOCK_SCOPE_* for ABI < 6 */
         ruleset_attr.scoped &= ~(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
                                  LANDLOCK_SCOPE_SIGNAL);
+
+        __attribute__((fallthrough));
+    case 6:
+        /* No ruleset_attr changes for ABI < 7 */
+
+        __attribute__((fallthrough));
+    case 7:
+        /* Removes port range support for ABI < 8 */
+        ruleset_attr.handled_access_net &=
+            ~(LANDLOCK_ACCESS_NET_BIND_TCP_RANGE |
+              LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE);
     }
 
 This enables the creation of an inclusive ruleset that will contain our rules.

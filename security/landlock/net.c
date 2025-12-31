@@ -20,11 +20,12 @@
 #include "ruleset.h"
 
 int landlock_append_net_rule(struct landlock_ruleset *const ruleset,
-			     const u16 port, access_mask_t access_rights)
+			     const u16 port, const u16 port_last,
+			     access_mask_t access_rights)
 {
 	int err;
 	const struct landlock_id id = {
-		.key.data = (__force uintptr_t)htons(port),
+		.key.data = landlock_net_port_make(port, port_last),
 		.type = LANDLOCK_KEY_NET_PORT,
 	};
 
@@ -47,6 +48,7 @@ static int current_check_access_socket(struct socket *const sock,
 				       access_mask_t access_request)
 {
 	__be16 port;
+	u16 port_host;
 	layer_mask_t layer_masks[LANDLOCK_NUM_ACCESS_NET] = {};
 	const struct landlock_rule *rule;
 	struct landlock_id id = {
@@ -187,8 +189,9 @@ static int current_check_access_socket(struct socket *const sock,
 	    address->sa_family != AF_UNSPEC)
 		return -EINVAL;
 
-	id.key.data = (__force uintptr_t)port;
-	BUILD_BUG_ON(sizeof(port) > sizeof(id.key.data));
+	port_host = ntohs(port);
+	id.key.data = landlock_net_port_make(port_host, port_host);
+	BUILD_BUG_ON(sizeof(port_host) > sizeof(id.key.data));
 
 	rule = landlock_find_rule(subject->domain, id);
 	access_request = landlock_init_layer_masks(subject->domain,

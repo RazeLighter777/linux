@@ -11,6 +11,7 @@
 
 #include <linux/cleanup.h>
 #include <linux/err.h>
+#include <linux/maple_tree.h>
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/refcount.h>
@@ -46,11 +47,30 @@ union landlock_key {
 	 */
 	struct landlock_object *object;
 	/**
-	 * @data: Raw data to identify an arbitrary 32-bit value
-	 * (e.g. a TCP port).
+	 * @data: Raw data to identify an arbitrary 32-bit value.
+	 *
+	 * For %LANDLOCK_KEY_NET_PORT, @data encodes a port range in host
+	 * endianness: bits [0..15] contain the first port, and bits [16..31]
+	 * contain the last port (inclusive).
 	 */
 	uintptr_t data;
 };
+
+static inline uintptr_t landlock_net_port_make(const u16 port,
+					  const u16 port_last)
+{
+	return (uintptr_t)port | ((uintptr_t)port_last << 16);
+}
+
+static inline u16 landlock_net_port_first(const uintptr_t key)
+{
+	return (u16)(key & 0xFFFF);
+}
+
+static inline u16 landlock_net_port_last(const uintptr_t key)
+{
+	return (u16)((key >> 16) & 0xFFFF);
+}
 
 /**
  * enum landlock_key_type - Type of &union landlock_key
@@ -127,12 +147,12 @@ struct landlock_ruleset {
 
 #if IS_ENABLED(CONFIG_INET)
 	/**
-	 * @root_net_port: Root of a red-black tree containing &struct
+	 * @root_net_port: Root of a maple tree containing &struct
 	 * landlock_rule nodes with network port. Once a ruleset is tied to a
 	 * process (i.e. as a domain), this tree is immutable until @usage
 	 * reaches zero.
 	 */
-	struct rb_root root_net_port;
+	struct maple_tree root_net_port;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
 	/**

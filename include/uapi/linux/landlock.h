@@ -177,7 +177,7 @@ struct landlock_net_port_attr {
 	 */
 	__u64 allowed_access;
 	/**
-	 * @port: Network port in host endianness.
+	 * @port: First network port in host endianness.
 	 *
 	 * It should be noted that port 0 passed to :manpage:`bind(2)` will bind
 	 * to an available port from the ephemeral port range.  This can be
@@ -185,10 +185,26 @@ struct landlock_net_port_attr {
 	 * (also used for IPv6).
 	 *
 	 * A Landlock rule with port 0 and the ``LANDLOCK_ACCESS_NET_BIND_TCP``
-	 * right means that requesting to bind on port 0 is allowed and it will
-	 * automatically translate to binding on the related port range.
+	 * right means that requesting to bind on port 0 is allowed.
 	 */
-	__u64 port;
+	union {
+		__u64 port;
+		struct {
+			__u16 port;
+			/**
+			 * @port_last: Last network port (inclusive) in host endianness.
+			 *
+			 * If set to 0, it is treated as equal to @port.
+			 *
+			 * Specifying a range (i.e. a non-zero @port_last different from
+			 * @port) requires that the related range access right is listed in
+			 * &struct landlock_ruleset_attr.handled_access_net (cf.
+			 * %LANDLOCK_ACCESS_NET_*_RANGE).
+			 */
+			__u16 port_last;
+			__u32 __reserved;
+		} port_range;
+	};
 };
 
 /**
@@ -339,10 +355,20 @@ struct landlock_net_port_attr {
  * - %LANDLOCK_ACCESS_NET_BIND_TCP: Bind a TCP socket to a local port.
  * - %LANDLOCK_ACCESS_NET_CONNECT_TCP: Connect an active TCP socket to
  *   a remote port.
+ *
+ * The following access rights enable port range support (cf.
+ * &struct landlock_net_port_attr.port_range).  These are required for
+ * backwards compatibility: specifying a range (i.e. a non-zero @port_last
+ * different from @port) is only allowed when the related range access right is
+ * listed in &struct landlock_ruleset_attr.handled_access_net.
+ *
+ * This is supported since Landlock ABI version 8.
  */
 /* clang-format off */
 #define LANDLOCK_ACCESS_NET_BIND_TCP			(1ULL << 0)
 #define LANDLOCK_ACCESS_NET_CONNECT_TCP			(1ULL << 1)
+#define LANDLOCK_ACCESS_NET_BIND_TCP_RANGE		(1ULL << 2)
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP_RANGE		(1ULL << 3)
 /* clang-format on */
 
 /**
