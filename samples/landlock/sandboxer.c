@@ -62,6 +62,7 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 #define ENV_TCP_CONNECT_NAME "LL_TCP_CONNECT"
 #define ENV_SCOPED_NAME "LL_SCOPED"
 #define ENV_FORCE_LOG_NAME "LL_FORCE_LOG"
+#define ENV_UNIX_CONNECT_NAME "LL_UNIX_CONNECT"
 #define ENV_DELIMITER ":"
 
 static int str2num(const char *numstr, __u64 *num_dst)
@@ -163,8 +164,14 @@ static int populate_ruleset_fs(const char *const env_var, const int ruleset_fd,
 			goto out_free_name;
 		}
 		path_beneath.allowed_access = allowed_access;
-		if (!S_ISDIR(statbuf.st_mode))
+		if (!S_ISDIR(statbuf.st_mode)) {
 			path_beneath.allowed_access &= ACCESS_FILE;
+			/* Keep CONNECT_UNIX for socket files. */
+			if (S_ISSOCK(statbuf.st_mode))
+				path_beneath.allowed_access |=
+					allowed_access &
+					LANDLOCK_ACCESS_FS_CONNECT_UNIX;
+		}
 		if (landlock_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH,
 				      &path_beneath, 0)) {
 			fprintf(stderr,
@@ -295,8 +302,7 @@ out_unset:
 	LANDLOCK_ACCESS_FS_MAKE_SYM | \
 	LANDLOCK_ACCESS_FS_REFER | \
 	LANDLOCK_ACCESS_FS_TRUNCATE | \
-	LANDLOCK_ACCESS_FS_IOCTL_DEV | \
-	LANDLOCK_ACCESS_FS_CONNECT_UNIX)
+	LANDLOCK_ACCESS_FS_IOCTL_DEV)
 
 /* clang-format on */
 
@@ -326,6 +332,7 @@ static const char help[] =
 	"* " ENV_SCOPED_NAME ": actions denied on the outside of the landlock domain\n"
 	"  - \"a\" to restrict opening abstract unix sockets\n"
 	"  - \"s\" to restrict sending signals\n"
+	"* " ENV_UNIX_CONNECT_NAME ": paths of unix sockets connections are allowed to\n"
 	"\n"
 	"A sandboxer should not log denied access requests to avoid spamming logs, "
 	"but to test audit we can set " ENV_FORCE_LOG_NAME "=1\n"
@@ -353,7 +360,7 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	      access_fs_rw = ACCESS_FS_ROUGHLY_READ | ACCESS_FS_ROUGHLY_WRITE;
 
 	struct landlock_ruleset_attr ruleset_attr = {
-		.handled_access_fs = access_fs_rw,
+		.handled_access_fs = access_fs_rw | LANDLOCK_ACCESS_FS_CONNECT_UNIX,
 		.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
 				      LANDLOCK_ACCESS_NET_CONNECT_TCP,
 		.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
@@ -460,9 +467,6 @@ int main(const int argc, char *const argv[], char *const *const envp)
 			"provided by ABI version %d (instead of %d).\n",
 			abi, LANDLOCK_ABI_LAST);
 	}
-	access_fs_ro &= ruleset_attr.handled_access_fs;
-	access_fs_rw &= ruleset_attr.handled_access_fs;
-
 	/* Removes bind access attribute if not supported by a user. */
 	env_port_name = getenv(ENV_TCP_BIND_NAME);
 	if (!env_port_name) {
@@ -475,6 +479,9 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		ruleset_attr.handled_access_net &=
 			~LANDLOCK_ACCESS_NET_CONNECT_TCP;
 	}
+
+	access_fs_ro &= ruleset_attr.handled_access_fs;
+	access_fs_rw &= ruleset_attr.handled_access_fs;
 
 	if (check_ruleset_scope(ENV_SCOPED_NAME, &ruleset_attr))
 		return 1;
@@ -508,6 +515,11 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		goto err_close_ruleset;
 	}
 	if (populate_ruleset_fs(ENV_FS_RW_NAME, ruleset_fd, access_fs_rw)) {
+		goto err_close_ruleset;
+	}
+	if (getenv(ENV_UNIX_CONNECT_NAME) &&
+	    populate_ruleset_fs(ENV_UNIX_CONNECT_NAME, ruleset_fd,
+				LANDLOCK_ACCESS_FS_CONNECT_UNIX)) {
 		goto err_close_ruleset;
 	}
 
