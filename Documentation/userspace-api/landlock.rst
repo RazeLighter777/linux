@@ -80,7 +80,9 @@ to be explicit about the denied-by-default access rights.
             LANDLOCK_ACCESS_FS_IOCTL_DEV,
         .handled_access_net =
             LANDLOCK_ACCESS_NET_BIND_TCP |
-            LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            LANDLOCK_ACCESS_NET_CONNECT_TCP |
+            LANDLOCK_ACCESS_NET_BIND_CAN_RAW |
+            LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM,
         .scoped =
             LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
             LANDLOCK_SCOPE_SIGNAL,
@@ -114,7 +116,7 @@ version, and only use the available subset of access rights:
         ruleset_attr.handled_access_fs &= ~LANDLOCK_ACCESS_FS_TRUNCATE;
         __attribute__((fallthrough));
     case 3:
-        /* Removes network support for ABI < 4 */
+        /* Removes network support (TCP) for ABI < 4 */
         ruleset_attr.handled_access_net &=
             ~(LANDLOCK_ACCESS_NET_BIND_TCP |
               LANDLOCK_ACCESS_NET_CONNECT_TCP);
@@ -127,6 +129,14 @@ version, and only use the available subset of access rights:
         /* Removes LANDLOCK_SCOPE_* for ABI < 6 */
         ruleset_attr.scoped &= ~(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
                                  LANDLOCK_SCOPE_SIGNAL);
+        __attribute__((fallthrough));
+    case 6:
+        __attribute__((fallthrough));
+    case 7:
+        /* Removes CAN support for ABI < 8 */
+        ruleset_attr.handled_access_net &=
+            ~(LANDLOCK_ACCESS_NET_BIND_CAN_RAW |
+              LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM);
     }
 
 This enables the creation of an inclusive ruleset that will contain our rules.
@@ -569,6 +579,32 @@ bind and connect actions to only a set of allowed ports thanks to the new
 ``LANDLOCK_ACCESS_NET_BIND_TCP`` and ``LANDLOCK_ACCESS_NET_CONNECT_TCP``
 access rights.
 
+CAN socket operations (ABI < 8)
+--------------------------------
+
+Starting with the Landlock ABI version 8, it is now possible to restrict CAN
+(Controller Area Network) socket operations thanks to the new
+``LANDLOCK_ACCESS_NET_BIND_CAN_RAW`` and ``LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM``
+access rights.
+
+For CAN sockets, the ``port`` attribute in ``struct landlock_net_port_attr``
+represents the CAN interface index (interface number), not a traditional port
+number. This is the numeric identifier for CAN interfaces such as can0, can1, etc.
+
+``LANDLOCK_ACCESS_NET_BIND_CAN_RAW`` controls binding of RAW CAN sockets
+(``SOCK_RAW``), which are typically used for sending and receiving raw CAN frames.
+This access right only applies to bind operations on RAW sockets.
+
+``LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM`` controls connecting of BCM (Broadcast
+Manager) CAN sockets (``SOCK_DGRAM``), which provide higher-level message
+scheduling and filtering capabilities. This access right only applies to connect
+operations on BCM sockets.
+
+Note that the kernel must be configured with CAN support (``CONFIG_CAN=y`` or
+``CONFIG_CAN=m``) for these access rights to function. Otherwise,
+sys_landlock_add_rule() returns an ``EAFNOSUPPORT`` error, which can safely be
+ignored if CAN socket operations are not needed for the system.
+
 Device IOCTL (ABI < 5)
 ----------------------
 
@@ -671,6 +707,13 @@ To be able to explicitly allow TCP operations (e.g., adding a network rule with
 (``CONFIG_INET=y``).  Otherwise, sys_landlock_add_rule() returns an
 ``EAFNOSUPPORT`` error, which can safely be ignored because this kind of TCP
 operation is already not possible.
+
+Similarly, to allow CAN (Controller Area Network) operations (e.g., adding a
+network rule with ``LANDLOCK_ACCESS_NET_BIND_CAN_RAW`` or
+``LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM``), the kernel must be configured with CAN
+support (``CONFIG_CAN=y`` or ``CONFIG_CAN=m``). Otherwise, sys_landlock_add_rule()
+returns an ``EAFNOSUPPORT`` error, which can safely be ignored if CAN operations
+are not required.
 
 Questions and answers
 =====================

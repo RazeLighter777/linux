@@ -110,6 +110,12 @@ Filesystem
 .. kernel-doc:: security/landlock/fs.h
     :identifiers:
 
+Network
+-------
+
+.. kernel-doc:: security/landlock/net.h
+    :identifiers:
+
 Process credential
 ------------------
 
