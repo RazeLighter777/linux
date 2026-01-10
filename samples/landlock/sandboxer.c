@@ -60,6 +60,8 @@ static inline int landlock_restrict_self(const int ruleset_fd,
 #define ENV_FS_RW_NAME "LL_FS_RW"
 #define ENV_TCP_BIND_NAME "LL_TCP_BIND"
 #define ENV_TCP_CONNECT_NAME "LL_TCP_CONNECT"
+#define ENV_CAN_BIND_RAW_NAME "LL_CAN_BIND_RAW"
+#define ENV_CAN_CONNECT_BCM_NAME "LL_CAN_CONNECT_BCM"
 #define ENV_SCOPED_NAME "LL_SCOPED"
 #define ENV_FORCE_LOG_NAME "LL_FORCE_LOG"
 #define ENV_DELIMITER ":"
@@ -299,7 +301,7 @@ out_unset:
 
 /* clang-format on */
 
-#define LANDLOCK_ABI_LAST 7
+#define LANDLOCK_ABI_LAST 8
 
 #define XSTR(s) #s
 #define STR(s) XSTR(s)
@@ -322,6 +324,8 @@ static const char help[] =
 	"means an empty list):\n"
 	"* " ENV_TCP_BIND_NAME ": ports allowed to bind (server)\n"
 	"* " ENV_TCP_CONNECT_NAME ": ports allowed to connect (client)\n"
+	"* " ENV_CAN_BIND_RAW_NAME ": CAN interfaces allowed to bind (RAW sockets)\n"
+	"* " ENV_CAN_CONNECT_BCM_NAME ": CAN interfaces allowed to connect (BCM sockets)\n"
 	"* " ENV_SCOPED_NAME ": actions denied on the outside of the landlock domain\n"
 	"  - \"a\" to restrict opening abstract unix sockets\n"
 	"  - \"s\" to restrict sending signals\n"
@@ -354,7 +358,9 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	struct landlock_ruleset_attr ruleset_attr = {
 		.handled_access_fs = access_fs_rw,
 		.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
-				      LANDLOCK_ACCESS_NET_CONNECT_TCP,
+				      LANDLOCK_ACCESS_NET_CONNECT_TCP |
+				      LANDLOCK_ACCESS_NET_BIND_CAN_RAW |
+				      LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM,
 		.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET |
 			  LANDLOCK_SCOPE_SIGNAL,
 	};
@@ -436,6 +442,12 @@ int main(const int argc, char *const argv[], char *const *const envp)
 		/* Removes LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON for ABI < 7 */
 		supported_restrict_flags &=
 			~LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
+		__attribute__((fallthrough));
+	case 7:
+		/* Removes CAN support for ABI < 8 */
+		ruleset_attr.handled_access_net &=
+			~(LANDLOCK_ACCESS_NET_BIND_CAN_RAW |
+			  LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM);
 
 		/* Must be printed for any ABI < LANDLOCK_ABI_LAST. */
 		fprintf(stderr,
@@ -467,6 +479,18 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	if (!env_port_name) {
 		ruleset_attr.handled_access_net &=
 			~LANDLOCK_ACCESS_NET_CONNECT_TCP;
+	}
+	/* Removes CAN bind access attribute if not supported by a user. */
+	env_port_name = getenv(ENV_CAN_BIND_RAW_NAME);
+	if (!env_port_name) {
+		ruleset_attr.handled_access_net &=
+			~LANDLOCK_ACCESS_NET_BIND_CAN_RAW;
+	}
+	/* Removes CAN connect access attribute if not supported by a user. */
+	env_port_name = getenv(ENV_CAN_CONNECT_BCM_NAME);
+	if (!env_port_name) {
+		ruleset_attr.handled_access_net &=
+			~LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM;
 	}
 
 	if (check_ruleset_scope(ENV_SCOPED_NAME, &ruleset_attr))
@@ -510,6 +534,15 @@ int main(const int argc, char *const argv[], char *const *const envp)
 	}
 	if (populate_ruleset_net(ENV_TCP_CONNECT_NAME, ruleset_fd,
 				 LANDLOCK_ACCESS_NET_CONNECT_TCP)) {
+		goto err_close_ruleset;
+	}
+
+	if (populate_ruleset_net(ENV_CAN_BIND_RAW_NAME, ruleset_fd,
+				 LANDLOCK_ACCESS_NET_BIND_CAN_RAW)) {
+		goto err_close_ruleset;
+	}
+	if (populate_ruleset_net(ENV_CAN_CONNECT_BCM_NAME, ruleset_fd,
+				 LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM)) {
 		goto err_close_ruleset;
 	}
 
