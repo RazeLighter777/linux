@@ -332,17 +332,34 @@ struct landlock_net_port_attr {
  * These flags enable to restrict a sandboxed process to a set of network
  * actions.
  *
- * This is supported since Landlock ABI version 4.
+ * TCP access rights (ABI version 4+):
  *
  * The following access rights apply to TCP port numbers:
  *
  * - %LANDLOCK_ACCESS_NET_BIND_TCP: Bind a TCP socket to a local port.
  * - %LANDLOCK_ACCESS_NET_CONNECT_TCP: Connect an active TCP socket to
  *   a remote port.
+ *
+ * CAN access rights (ABI version 8+):
+ *
+ * The following access rights apply to CAN (Controller Area Network) interface
+ * numbers. The ``port`` attribute in ``struct landlock_net_port_attr`` should
+ * be set to the CAN interface index (e.g., the interface number for can0, can1,
+ * etc.).
+ *
+ * - %LANDLOCK_ACCESS_NET_BIND_CAN_RAW: Bind a CAN RAW socket to a CAN
+ *   interface. This access right only applies to RAW sockets (``SOCK_RAW``).
+ * - %LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM: Connect a CAN BCM socket to a CAN
+ *   interface. This access right only applies to BCM sockets (``SOCK_DGRAM``).
+ *
+ * Note: For CAN sockets, the ``port`` field in network rules represents the
+ * CAN interface index, not a traditional port number.
  */
 /* clang-format off */
 #define LANDLOCK_ACCESS_NET_BIND_TCP			(1ULL << 0)
 #define LANDLOCK_ACCESS_NET_CONNECT_TCP			(1ULL << 1)
+#define LANDLOCK_ACCESS_NET_BIND_CAN_RAW			(1ULL << 2)
+#define LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM			(1ULL << 3)
 /* clang-format on */
 
 /**
