@@ -10,7 +10,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/securebits.h>
+#include <net/if.h>
 #include <sys/capability.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -250,4 +252,33 @@ static void __maybe_unused set_unix_address(struct service_fixture *const srv,
 		index);
 	srv->unix_addr_len = SUN_LEN(&srv->unix_addr);
 	srv->unix_addr.sun_path[0] = '\0';
+}
+
+/* CAN (Controller Area Network) test helpers */
+struct can_interface {
+	const char *name;
+	unsigned int ifindex;
+};
+
+static int __maybe_unused get_can_interface_index(const char *ifname)
+{
+	struct ifreq ifr;
+	int sock_fd;
+	int ret;
+
+	sock_fd = socket(AF_CAN, SOCK_RAW, 0);
+	if (sock_fd < 0)
+		return -errno;
+
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+
+	if (ioctl(sock_fd, SIOCGIFINDEX, &ifr) < 0) {
+		ret = -errno;
+		close(sock_fd);
+		return ret;
+	}
+
+	close(sock_fd);
+	return ifr.ifr_ifindex;
 }
