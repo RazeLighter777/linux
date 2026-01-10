@@ -45,6 +45,10 @@ static struct landlock_ruleset *create_ruleset(const u32 num_layers)
 	new_ruleset->root_net_port = RB_ROOT;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+#if IS_ENABLED(CONFIG_CAN)
+	new_ruleset->root_net_can = RB_ROOT;
+#endif /* IS_ENABLED(CONFIG_CAN) */
+
 	new_ruleset->num_layers = num_layers;
 	/*
 	 * hierarchy = NULL
@@ -99,6 +103,11 @@ static bool is_object_pointer(const enum landlock_key_type key_type)
 	case LANDLOCK_KEY_NET_PORT:
 		return false;
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+#if IS_ENABLED(CONFIG_CAN)
+	case LANDLOCK_KEY_NET_CAN:
+		return false;
+#endif /* IS_ENABLED(CONFIG_CAN) */
 
 	default:
 		WARN_ON_ONCE(1);
@@ -156,6 +165,11 @@ static struct rb_root *get_root(struct landlock_ruleset *const ruleset,
 	case LANDLOCK_KEY_NET_PORT:
 		return &ruleset->root_net_port;
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+#if IS_ENABLED(CONFIG_CAN)
+	case LANDLOCK_KEY_NET_CAN:
+		return &ruleset->root_net_can;
+#endif /* IS_ENABLED(CONFIG_CAN) */
 
 	default:
 		WARN_ON_ONCE(1);
@@ -395,6 +409,13 @@ static int merge_ruleset(struct landlock_ruleset *const dst,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+#if IS_ENABLED(CONFIG_CAN)
+	/* Merges the @src CAN interface tree. */
+	err = merge_tree(dst, src, LANDLOCK_KEY_NET_CAN);
+	if (err)
+		goto out_unlock;
+#endif /* IS_ENABLED(CONFIG_CAN) */
+
 out_unlock:
 	mutex_unlock(&src->lock);
 	mutex_unlock(&dst->lock);
@@ -458,6 +479,13 @@ static int inherit_ruleset(struct landlock_ruleset *const parent,
 		goto out_unlock;
 #endif /* IS_ENABLED(CONFIG_INET) */
 
+#if IS_ENABLED(CONFIG_CAN)
+	/* Copies the @parent CAN interface tree. */
+	err = inherit_tree(parent, child, LANDLOCK_KEY_NET_CAN);
+	if (err)
+		goto out_unlock;
+#endif /* IS_ENABLED(CONFIG_CAN) */
+
 	if (WARN_ON_ONCE(child->num_layers <= parent->num_layers)) {
 		err = -EINVAL;
 		goto out_unlock;
@@ -493,6 +521,12 @@ static void free_ruleset(struct landlock_ruleset *const ruleset)
 					     &ruleset->root_net_port, node)
 		free_rule(freeme, LANDLOCK_KEY_NET_PORT);
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+#if IS_ENABLED(CONFIG_CAN)
+	rbtree_postorder_for_each_entry_safe(freeme, next,
+					     &ruleset->root_net_can, node)
+		free_rule(freeme, LANDLOCK_KEY_NET_CAN);
+#endif /* IS_ENABLED(CONFIG_CAN) */
 
 	landlock_put_hierarchy(ruleset->hierarchy);
 	kfree(ruleset);
@@ -707,6 +741,13 @@ landlock_init_layer_masks(const struct landlock_ruleset *const domain,
 		num_access = LANDLOCK_NUM_ACCESS_NET;
 		break;
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+#if IS_ENABLED(CONFIG_CAN)
+	case LANDLOCK_KEY_NET_CAN:
+		get_access_mask = landlock_get_net_access_mask;
+		num_access = LANDLOCK_NUM_ACCESS_NET;
+		break;
+#endif /* IS_ENABLED(CONFIG_CAN) */
 
 	default:
 		WARN_ON_ONCE(1);

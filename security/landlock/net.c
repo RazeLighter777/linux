@@ -9,6 +9,7 @@
 #include <linux/in.h>
 #include <linux/lsm_audit.h>
 #include <linux/net.h>
+#include <linux/can.h>
 #include <linux/socket.h>
 #include <net/ipv6.h>
 
@@ -23,9 +24,16 @@ int landlock_append_net_rule(struct landlock_ruleset *const ruleset,
 			     const u16 port, access_mask_t access_rights)
 {
 	int err;
+	const enum landlock_key_type key_type =
+		(access_rights & (LANDLOCK_ACCESS_NET_BIND_CAN_RAW |
+				  LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM)) ?
+			LANDLOCK_KEY_NET_CAN :
+			LANDLOCK_KEY_NET_PORT;
 	const struct landlock_id id = {
-		.key.data = (__force uintptr_t)htons(port),
-		.type = LANDLOCK_KEY_NET_PORT,
+		.type = key_type,
+		.key.data = (key_type == LANDLOCK_KEY_NET_CAN) ?
+			(__force uintptr_t)port :
+			(__force uintptr_t)htons(port),
 	};
 
 	BUILD_BUG_ON(sizeof(port) > sizeof(id.key.data));
@@ -49,9 +57,6 @@ static int current_check_access_socket(struct socket *const sock,
 	__be16 port;
 	layer_mask_t layer_masks[LANDLOCK_NUM_ACCESS_NET] = {};
 	const struct landlock_rule *rule;
-	struct landlock_id id = {
-		.type = LANDLOCK_KEY_NET_PORT,
-	};
 	const struct access_masks masks = {
 		.net = access_request,
 	};
@@ -62,7 +67,9 @@ static int current_check_access_socket(struct socket *const sock,
 	if (!subject)
 		return 0;
 
-	if (!sk_is_tcp(sock->sk))
+	/* Allow TCP and CAN sockets */
+	if (!sk_is_tcp(sock->sk) &&
+	    sock->sk->__sk_common.skc_family != AF_CAN)
 		return 0;
 
 	/* Checks for minimal header length to safely read sa_family. */
@@ -170,6 +177,20 @@ static int current_check_access_socket(struct socket *const sock,
 	}
 #endif /* IS_ENABLED(CONFIG_IPV6) */
 
+#if IS_ENABLED(CONFIG_CAN)
+	case AF_CAN: {
+		const struct sockaddr_can *addr_can;
+
+		if (addrlen < sizeof(struct sockaddr_can))
+			return -EINVAL;
+
+		addr_can = (struct sockaddr_can *)address;
+		/* Note CAN doesn't use ports in the traditional sense, this is an interface ID */
+		port = addr_can->can_ifindex;
+		audit_net.netif = addr_can->can_ifindex;
+		break;
+	}
+#endif /* IS_ENABLED(CONFIG_CAN) */
 	default:
 		return 0;
 	}
@@ -187,16 +208,27 @@ static int current_check_access_socket(struct socket *const sock,
 	    address->sa_family != AF_UNSPEC)
 		return -EINVAL;
 
-	id.key.data = (__force uintptr_t)port;
-	BUILD_BUG_ON(sizeof(port) > sizeof(id.key.data));
+	/* Set the appropriate key type based on socket family */
+	{
+		const enum landlock_key_type key_type =
+			(address->sa_family == AF_CAN) ?
+				LANDLOCK_KEY_NET_CAN :
+				LANDLOCK_KEY_NET_PORT;
+		const struct landlock_id id = {
+			.type = key_type,
+			.key.data = (__force uintptr_t)port,
+		};
 
-	rule = landlock_find_rule(subject->domain, id);
-	access_request = landlock_init_layer_masks(subject->domain,
-						   access_request, &layer_masks,
-						   LANDLOCK_KEY_NET_PORT);
-	if (landlock_unmask_layers(rule, access_request, &layer_masks,
-				   ARRAY_SIZE(layer_masks)))
-		return 0;
+		BUILD_BUG_ON(sizeof(port) > sizeof(id.key.data));
+
+		rule = landlock_find_rule(subject->domain, id);
+		access_request = landlock_init_layer_masks(subject->domain,
+							   access_request, &layer_masks,
+							   key_type);
+		if (landlock_unmask_layers(rule, access_request, &layer_masks,
+					   ARRAY_SIZE(layer_masks)))
+			return 0;
+	}
 
 	audit_net.family = address->sa_family;
 	landlock_log_denial(subject,
@@ -214,21 +246,73 @@ static int current_check_access_socket(struct socket *const sock,
 static int hook_socket_bind(struct socket *const sock,
 			    struct sockaddr *const address, const int addrlen)
 {
+	access_mask_t access_request;
+
+	if (!address || !sock)
+		return 0;
+
+	if (address->sa_family == AF_CAN && sock->type == SOCK_RAW)
+		access_request = LANDLOCK_ACCESS_NET_BIND_CAN_RAW;
+	else
+		access_request = LANDLOCK_ACCESS_NET_BIND_TCP;
+
 	return current_check_access_socket(sock, address, addrlen,
-					   LANDLOCK_ACCESS_NET_BIND_TCP);
+					   access_request);
 }
 
 static int hook_socket_connect(struct socket *const sock,
 			       struct sockaddr *const address,
 			       const int addrlen)
 {
+	access_mask_t access_request;
+
+	if (address->sa_family == AF_CAN && sock->type == SOCK_DGRAM)
+		access_request = LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM;
+	else
+		access_request = LANDLOCK_ACCESS_NET_CONNECT_TCP;
+
 	return current_check_access_socket(sock, address, addrlen,
-					   LANDLOCK_ACCESS_NET_CONNECT_TCP);
+					   access_request);
+}
+
+static int hook_socket_sendmsg(struct socket *const sock,
+			       struct msghdr *const msg, const int size)
+{
+	if (sock->sk->__sk_common.skc_family != AF_CAN)
+		return 0;
+
+	if (sock->type == SOCK_DGRAM && msg->msg_name) {
+		return current_check_access_socket(sock,
+						    (struct sockaddr *)msg->msg_name,
+						    msg->msg_namelen,
+						    LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM);
+	}
+
+	return 0;
+}
+
+static int hook_socket_recvmsg(struct socket *const sock,
+			       struct msghdr *const msg, const int size,
+			       const int flags)
+{
+	if (sock->sk->__sk_common.skc_family != AF_CAN)
+		return 0;
+
+	if (sock->type == SOCK_DGRAM && msg->msg_name) {
+		return current_check_access_socket(sock,
+						    (struct sockaddr *)msg->msg_name,
+						    msg->msg_namelen,
+						    LANDLOCK_ACCESS_NET_CONNECT_CAN_BCM);
+	}
+
+	return 0;
 }
 
 static struct security_hook_list landlock_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(socket_bind, hook_socket_bind),
 	LSM_HOOK_INIT(socket_connect, hook_socket_connect),
+	LSM_HOOK_INIT(socket_sendmsg, hook_socket_sendmsg),
+	LSM_HOOK_INIT(socket_recvmsg, hook_socket_recvmsg),
 };
 
 __init void landlock_add_net_hooks(void)

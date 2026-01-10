@@ -66,6 +66,11 @@ enum landlock_key_type {
 	 * node keys.
 	 */
 	LANDLOCK_KEY_NET_PORT,
+	/**
+	 * @LANDLOCK_KEY_NET_CAN: Type of &landlock_ruleset.root_net_can's
+	 * node keys.
+	 */
+	LANDLOCK_KEY_NET_CAN,
 };
 
 /**
@@ -134,6 +139,16 @@ struct landlock_ruleset {
 	 */
 	struct rb_root root_net_port;
 #endif /* IS_ENABLED(CONFIG_INET) */
+
+#if IS_ENABLED(CONFIG_CAN)
+	/**
+	 * @root_net_can: Root of a red-black tree containing &struct
+	 * landlock_rule nodes with CAN interface IDs. Once a ruleset is tied
+	 * to a process (i.e. as a domain), this tree is immutable until @usage
+	 * reaches zero.
+	 */
+	struct rb_root root_net_can;
+#endif /* IS_ENABLED(CONFIG_CAN) */
 
 	/**
 	 * @hierarchy: Enables hierarchy identification even when a parent
