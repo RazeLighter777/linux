@@ -77,7 +77,8 @@ to be explicit about the denied-by-default access rights.
             LANDLOCK_ACCESS_FS_MAKE_SYM |
             LANDLOCK_ACCESS_FS_REFER |
             LANDLOCK_ACCESS_FS_TRUNCATE |
-            LANDLOCK_ACCESS_FS_IOCTL_DEV,
+            LANDLOCK_ACCESS_FS_IOCTL_DEV |
+            LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
         .handled_access_net =
             LANDLOCK_ACCESS_NET_BIND_TCP |
             LANDLOCK_ACCESS_NET_CONNECT_TCP,
@@ -131,7 +132,8 @@ version, and only use the available subset of access rights:
         __attribute__((fallthrough));
     case 7:
         /* Removes LANDLOCK_SCOPE_PATHNAME_UNIX_SOCKET for ABI < 8 */
-        ruleset_attr.scoped &= ~LANDLOCK_SCOPE_PATHNAME_UNIX_SOCKET;
+        ruleset_attr.scoped &= ~(LANDLOCK_SCOPE_PATHNAME_UNIX_SOCKET |
+                                 LANDLOCK_ACCESS_FS_RESOLVE_UNIX);
     }
 
 This enables the creation of an inclusive ruleset that will contain our rules.
@@ -630,6 +632,12 @@ expected user credentials, is trusted.  Without this protection, sandbox
 escapes may be possible, especially when running in a standard desktop
 environment, such as by using systemd-run, or sockets exposed by other
 common applications.
+Pathname UNIX sockets (ABI < 8)
+-------------------------------
+
+Starting with the Landlock ABI version 8, it is possible to restrict
+connections to pathname UNIX domain sockets (:manpage:`unix(7)`) using
+the new ``LANDLOCK_ACCESS_FS_RESOLVE_UNIX`` right.
 
 .. _kernel_support:
 
