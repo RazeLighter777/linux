@@ -29,7 +29,27 @@ struct landlock_layer {
 	/**
 	 * @level: Position of this layer in the layer stack.  Starts from 1.
 	 */
-	u16 level;
+	u8 level;
+	/**
+	 * @flags: Bitfield for special flags attached to this rule.
+	 */
+	struct {
+		/**
+		 * @no_inherit: Prevents this rule from inheriting access rights
+		 * from ancestor inodes. Only used for filesystem rules.
+		 */
+		bool no_inherit:1;
+		/**
+		 * @has_no_inherit_descendant: Marker to indicate that this layer
+		 * has at least one descendant directory with a rule having the
+		 * no_inherit flag.  Only used for filesystem rules.
+		 * This "flag" is not set by the user, but by Landlock on
+		 * parent directories of rules when the child rule has
+		 * a rule with the no_inherit flag to deny topology changes.
+		 */
+		bool has_no_inherit_descendant:1;
+
+	} flags;
 	/**
 	 * @access: Bitfield of allowed actions on the kernel object.  They are
 	 * relative to the object type (e.g. %LANDLOCK_ACTION_FS_READ).
@@ -313,8 +333,31 @@ struct layer_access_masks {
 	access_mask_t access[LANDLOCK_MAX_NUM_LAYERS];
 };
 
+/**
+ * struct collected_rule_flags - Hold accumulated flags/markers for each layer.
+ */
+struct collected_rule_flags {
+	/**
+	 * @no_inherit: Bitmask of layers for which the no_inherit flag is
+	 * effective.  Prevents access rights from being inherited from
+	 * ancestor inodes for these layers.  Only used for filesystem rules.
+	 */
+	u16 no_inherit;
+	/**
+	 * @has_no_inherit_descendant: Bitmask of layers for which the
+	 * has_no_inherit_descendant marker is set.  This marker indicates
+	 * that the layer has at least one descendant directory with a rule
+	 * having the no_inherit flag.  Only used for filesystem rules.
+	 * This is not a flag itself, but a marker set on ancestors
+	 * of rules with the no_inherit flag to deny topology changes
+	 * in the direct parent path.
+	 */
+	u16 has_no_inherit_descendant;
+};
+
 bool landlock_unmask_layers(const struct landlock_rule *const rule,
-			    struct layer_access_masks *masks);
+			    struct layer_access_masks *masks,
+			    struct collected_rule_flags *const rule_flags);
 
 access_mask_t
 landlock_init_layer_masks(const struct landlock_ruleset *const domain,
