@@ -317,6 +317,43 @@ retry:
 	LANDLOCK_ACCESS_FS_IOCTL_DEV)
 /* clang-format on */
 
+/**
+ * enum landlock_walk_result - Result codes for landlock_walk_path_up()
+ * @LANDLOCK_WALK_CONTINUE: Path is now neither the real root nor an internal mount point.
+ * @LANDLOCK_WALK_STOP_REAL_ROOT: Path has reached the real VFS root.
+ * @LANDLOCK_WALK_INTERNAL: Path has reached an internal mount point.
+ */
+enum landlock_walk_result {
+	LANDLOCK_WALK_CONTINUE,
+	LANDLOCK_WALK_STOP_REAL_ROOT,
+	LANDLOCK_WALK_INTERNAL,
+};
+
+static enum landlock_walk_result landlock_walk_path_up(struct path *const path)
+{
+	while (path->dentry == path->mnt->mnt_root) {
+		if (!follow_up(path))
+			return LANDLOCK_WALK_STOP_REAL_ROOT;
+	}
+
+	if (unlikely(IS_ROOT(path->dentry))) {
+		if (likely(path->mnt->mnt_flags & MNT_INTERNAL))
+			return LANDLOCK_WALK_INTERNAL;
+		dput(path->dentry);
+		path->dentry = dget(path->mnt->mnt_root);
+		return LANDLOCK_WALK_CONTINUE;
+	}
+
+	struct dentry *const parent = dget_parent(path->dentry);
+
+	dput(path->dentry);
+	path->dentry = parent;
+	return LANDLOCK_WALK_CONTINUE;
+}
+
+static const struct landlock_rule *find_rule(const struct landlock_ruleset *const domain,
+					     const struct dentry *const dentry);
+
 /*
  * @path: Should have been checked by get_path_from_fd().
  */
@@ -836,6 +873,7 @@ static bool is_access_to_paths_allowed(
 	 */
 	while (true) {
 		const struct landlock_rule *rule;
+		enum landlock_walk_result walk_res;
 
 		/*
 		 * If at least all accesses allowed on the destination are
@@ -890,47 +928,25 @@ static bool is_access_to_paths_allowed(
 		/* Stops when a rule from each layer grants access. */
 		if (allowed_parent1 && allowed_parent2)
 			break;
+		/* Otherwise, keep walking up to the root. */
+		walk_res = landlock_walk_path_up(&walker_path);
 
-jump_up:
-		if (walker_path.dentry == walker_path.mnt->mnt_root) {
-			if (follow_up(&walker_path)) {
-				/* Ignores hidden mount points. */
-				goto jump_up;
-			} else {
-				/*
-				 * Stops at the real root.  Denies access
-				 * because not all layers have granted access.
-				 */
-				break;
-			}
-		}
-
-		if (unlikely(IS_ROOT(walker_path.dentry))) {
-			if (likely(walker_path.mnt->mnt_flags & MNT_INTERNAL)) {
-				/*
-				 * Stops and allows access when reaching disconnected root
-				 * directories that are part of internal filesystems (e.g. nsfs,
-				 * which is reachable through /proc/<pid>/ns/<namespace>).
-				 */
-				allowed_parent1 = true;
-				allowed_parent2 = true;
-				break;
-			}
-
+		if (walk_res == LANDLOCK_WALK_INTERNAL) {
 			/*
-			 * We reached a disconnected root directory from a bind mount.
-			 * Let's continue the walk with the mount point we missed.
+			 * Stops and allows access when reaching disconnected root
+			 * directories that are part of internal filesystems (e.g. nsfs,
+			 * which is reachable through /proc/<pid>/ns/<namespace>).
 			 */
-			dput(walker_path.dentry);
-			walker_path.dentry = walker_path.mnt->mnt_root;
-			dget(walker_path.dentry);
-		} else {
-			struct dentry *const parent_dentry =
-				dget_parent(walker_path.dentry);
-
-			dput(walker_path.dentry);
-			walker_path.dentry = parent_dentry;
+			allowed_parent1 = true;
+			allowed_parent2 = true;
+			break;
 		}
+		/*
+		 * Stops at the real root.  Denies access
+		 * because not all layers have granted access
+		 */
+		else if (walk_res == LANDLOCK_WALK_STOP_REAL_ROOT)
+			break;
 	}
 	path_put(&walker_path);
 
@@ -1023,14 +1039,13 @@ static access_mask_t maybe_remove(const struct dentry *const dentry)
  * collect_domain_accesses - Walk through a file path and collect accesses
  *
  * @domain: Domain to check against.
- * @mnt_root: Last directory to check.
  * @dir: Directory to start the walk from.
  * @layer_masks_dom: Where to store the collected accesses.
  *
- * This helper is useful to begin a path walk from the @dir directory to a
- * @mnt_root directory used as a mount point.  This mount point is the common
+ * This helper is useful to begin a path walk from the @dir directory to the
+ * mount root used as a mount point.  This mount point is the common
  * ancestor between the source and the destination of a renamed and linked
- * file.  While walking from @dir to @mnt_root, we record all the domain's
+ * file.  While walking from @dir to the root, we record all the domain's
  * allowed accesses in @layer_masks_dom.
  *
  * Because of disconnected directories, this walk may not reach @mnt_dir.  In
@@ -1042,31 +1057,32 @@ static access_mask_t maybe_remove(const struct dentry *const dentry)
  *
  * Returns:
  * - true if all the domain access rights are allowed for @dir;
- * - false if the walk reached @mnt_root.
+ * - false if the walk reached the mount root.
  */
-static bool
-collect_domain_accesses(const struct landlock_ruleset *const domain,
-			const struct dentry *const mnt_root, struct dentry *dir,
-			struct layer_access_masks *layer_masks_dom,
-			struct collected_rule_flags *const rule_flags)
+static bool collect_domain_accesses(const struct landlock_ruleset *const domain,
+				    const struct path *const dir,
+				    struct layer_access_masks *layer_masks_dom,
+				    struct collected_rule_flags *const rule_flags)
 {
 	bool ret = false;
+	struct path walker;
 
-	if (WARN_ON_ONCE(!domain || !mnt_root || !dir || !layer_masks_dom))
+	if (WARN_ON_ONCE(!domain || !dir || !layer_masks_dom))
 		return true;
-	if (is_nouser_or_private(dir))
+	if (is_nouser_or_private(dir->dentry))
 		return true;
 
 	if (!landlock_init_layer_masks(domain, LANDLOCK_MASK_ACCESS_FS,
 				       layer_masks_dom, LANDLOCK_KEY_INODE))
 		return true;
 
-	dget(dir);
+	walker = *dir;
+	path_get(&walker);
 	while (true) {
-		struct dentry *parent_dentry;
+		enum landlock_walk_result walk_res;
 
 		/* Gets all layers allowing all domain accesses. */
-		if (landlock_unmask_layers(find_rule(domain, dir),
+		if (landlock_unmask_layers(find_rule(domain, walker.dentry),
 					   layer_masks_dom, rule_flags)) {
 			/*
 			 * Stops when all handled accesses are allowed by at
@@ -1080,14 +1096,13 @@ collect_domain_accesses(const struct landlock_ruleset *const domain,
 		 * Stops at the mount point or the filesystem root for a disconnected
 		 * directory.
 		 */
-		if (dir == mnt_root || unlikely(IS_ROOT(dir)))
+		if (walker.dentry == dir->mnt->mnt_root && walker.mnt == dir->mnt)
 			break;
-
-		parent_dentry = dget_parent(dir);
-		dput(dir);
-		dir = parent_dentry;
+		walk_res = landlock_walk_path_up(&walker);
+		if (walk_res != LANDLOCK_WALK_CONTINUE)
+			break;
 	}
-	dput(dir);
+	path_put(&walker);
 	return ret;
 }
 
@@ -1219,12 +1234,15 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 						      old_dentry->d_parent;
 
 	/* new_dir->dentry is equal to new_dentry->d_parent */
-	allow_parent1 = collect_domain_accesses(subject->domain, mnt_dir.dentry,
-						old_parent,
+	allow_parent1 = collect_domain_accesses(subject->domain,
+						&(const struct path) {
+							.mnt = mnt_dir.mnt,
+							.dentry = old_parent,
+						},
 						&layer_masks_parent1,
 						&rule_flags_parent1);
-	allow_parent2 = collect_domain_accesses(subject->domain, mnt_dir.dentry,
-						new_dir->dentry,
+	allow_parent2 = collect_domain_accesses(subject->domain,
+						new_dir,
 						&layer_masks_parent2,
 						&rule_flags_parent2);
 	if (allow_parent1 && allow_parent2)
