@@ -381,6 +381,48 @@ int landlock_append_fs_rule(struct landlock_ruleset *const ruleset,
 		return PTR_ERR(id.key.object);
 	mutex_lock(&ruleset->lock);
 	err = landlock_insert_rule(ruleset, id, access_rights, flags);
+	if (err || !(flags & LANDLOCK_ADD_RULE_NO_INHERIT))
+		goto out_unlock;
+
+	/* Create ancestor rules and set has_no_inherit_descendant flags */
+	struct path walker = *path;
+
+	path_get(&walker);
+	while (landlock_walk_path_up(&walker) == LANDLOCK_WALK_CONTINUE) {
+		struct landlock_rule *ancestor_rule;
+
+		if (WARN_ON_ONCE(!walker.dentry || d_is_negative(walker.dentry))) {
+			err = -EIO;
+			break;
+		}
+
+		ancestor_rule = (struct landlock_rule *)find_rule(ruleset, walker.dentry);
+		if (!ancestor_rule) {
+			struct landlock_id ancestor_id = {
+				.type = LANDLOCK_KEY_INODE,
+				.key.object = get_inode_object(d_backing_inode(walker.dentry)),
+			};
+
+			if (IS_ERR(ancestor_id.key.object)) {
+				err = PTR_ERR(ancestor_id.key.object);
+				break;
+			}
+			err = landlock_insert_rule(ruleset, ancestor_id, 0, 0);
+			landlock_put_object(ancestor_id.key.object);
+			if (err)
+				break;
+
+			ancestor_rule = (struct landlock_rule *)
+				find_rule(ruleset, walker.dentry);
+		}
+		if (WARN_ON_ONCE(!ancestor_rule || ancestor_rule->num_layers != 1)) {
+			err = -EIO;
+			break;
+		}
+		ancestor_rule->layers[0].flags.has_no_inherit_descendant = true;
+	}
+	path_put(&walker);
+out_unlock:
 	mutex_unlock(&ruleset->lock);
 	/*
 	 * No need to check for an error because landlock_insert_rule()
@@ -1107,6 +1149,57 @@ static bool collect_domain_accesses(const struct landlock_ruleset *const domain,
 }
 
 /**
+ * deny_no_inherit_topology_change - deny topology changes on sealed paths
+ * @subject: Subject performing the operation (contains the domain).
+ * @path: Path whose dentry is the target of the topology modification.
+ *
+ * Checks whether any domain layers are sealed against topology changes at
+ * @path.  If so, emit an audit record and return -EACCES.  Otherwise return 0.
+ */
+static int deny_no_inherit_topology_change(const struct landlock_cred_security *subject,
+					   struct dentry *const dcache_entry)
+{
+	layer_mask_t sealed_layers = 0;
+	layer_mask_t override_layers = 0;
+	const struct landlock_rule *rule;
+	size_t layer_index;
+	unsigned long audit_layer_index;
+
+	if (WARN_ON_ONCE(!subject || !dcache_entry || d_is_negative(dcache_entry)))
+		return 0;
+
+	rule = find_rule(subject->domain, dcache_entry);
+	if (!rule)
+		return 0;
+
+	for (layer_index = 0; layer_index < rule->num_layers; layer_index++) {
+		const struct landlock_layer *layer = &rule->layers[layer_index];
+		layer_mask_t layer_bit = BIT_ULL(layer->level - 1);
+
+		if (layer->flags.no_inherit ||
+		    layer->flags.has_no_inherit_descendant)
+			sealed_layers |= layer_bit;
+		else
+			override_layers |= layer_bit;
+	}
+
+	sealed_layers &= ~override_layers;
+	if (!sealed_layers)
+		return 0;
+
+	audit_layer_index = __ffs((unsigned long)sealed_layers);
+	landlock_log_denial(subject, &(struct landlock_request) {
+		.type = LANDLOCK_REQUEST_FS_CHANGE_TOPOLOGY,
+		.audit = {
+			.type = LSM_AUDIT_DATA_DENTRY,
+			.u.dentry = dcache_entry,
+		},
+		.layer_plus_one = audit_layer_index + 1,
+	});
+	return -EACCES;
+}
+
+/**
  * current_check_refer_path - Check if a rename or link action is allowed
  *
  * @old_dentry: File or directory requested to be moved or linked.
@@ -1192,6 +1285,15 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 	access_request_parent2 =
 		get_mode_access(d_backing_inode(old_dentry)->i_mode);
 	if (removable) {
+		int err = deny_no_inherit_topology_change(subject, old_dentry);
+
+		if (err)
+			return err;
+		if (exchange) {
+			err = deny_no_inherit_topology_change(subject, new_dentry);
+			if (err)
+				return err;
+		}
 		access_request_parent1 |= maybe_remove(old_dentry);
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
@@ -1591,12 +1693,31 @@ static int hook_path_symlink(const struct path *const dir,
 static int hook_path_unlink(const struct path *const dir,
 			    struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_FILE);
 }
 
 static int hook_path_rmdir(const struct path *const dir,
 			   struct dentry *const dentry)
 {
+	const struct landlock_cred_security *const subject =
+		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
+	int err;
+
+	if (subject) {
+		err = deny_no_inherit_topology_change(subject, dentry);
+		if (err)
+			return err;
+	}
+
 	return current_check_access_path(dir, LANDLOCK_ACCESS_FS_REMOVE_DIR);
 }
 
