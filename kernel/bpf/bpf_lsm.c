@@ -538,8 +538,9 @@ bpf_landlock_restrict_binprm(struct linux_binprm *bprm,
 	if (err)
 		return err;
 
-	return landlock_restrict_cred(
-		bprm->cred, (struct landlock_ruleset *)ruleset, flags);
+	return landlock_restrict_cred(bprm->cred,
+				      (struct landlock_ruleset *)ruleset,
+				      flags);
 }
 
 /* We define stubs for these to allow ebpf programs using landlock kfuncs to load
