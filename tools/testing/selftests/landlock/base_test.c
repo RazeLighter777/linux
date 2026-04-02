@@ -306,7 +306,7 @@ TEST(restrict_self_fd_logging_flags)
 
 TEST(restrict_self_logging_flags)
 {
-	const __u32 last_flag = LANDLOCK_RESTRICT_SELF_TSYNC;
+	const __u32 last_flag = LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS;
 
 	/* Tests invalid flag combinations. */
 
