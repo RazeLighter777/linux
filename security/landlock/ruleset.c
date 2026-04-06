@@ -121,15 +121,22 @@ int landlock_restrict_cred_precheck(const __u32 flags,
 
 	/*
 	 * Similar checks as for seccomp(2), except that an -EPERM may be
-	 * returned.
+	 * returned, or no_new_privs may be set by the caller via
+	 * LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS.
 	 */
 	if (!task_no_new_privs(current) &&
 	    !ns_capable_noaudit(current_user_ns(), CAP_SYS_ADMIN)) {
+		if (!(flags & LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS) ||
+		    (flags & ~LANDLOCK_MASK_RESTRICT_SELF))
 			return -EPERM;
 	}
 
 	if (flags & ~LANDLOCK_MASK_RESTRICT_SELF)
 		return -EINVAL;
+
+	if (!task_no_new_privs(current) &&
+	    !ns_capable_noaudit(current_user_ns(), CAP_SYS_ADMIN))
+		task_set_no_new_privs(current);
 
 	return 0;
 }
